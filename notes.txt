@@ -1,0 +1,4 @@
+#notes for bittrrt
+
+# To RUN tests
+python -m unittest tests.test_config -v

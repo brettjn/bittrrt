@@ -1,10 +1,144 @@
-VERSION = "0.1"
-VERSION_NOTE = "Added Connection/SyncTest, start_server/run_loop, config-based --sync-test, establish handling, graceful shutdown on CTRL+C"
+VERSION = "0.2"
+VERSION_NOTE = "Added SequenceSpan class with binary serialization, fixed missing imports (struct, typing), config creation tests"
 
 import os
 import sys
 import time
+import struct
+from typing import Optional, List, Tuple
 from termcolor import colored
+
+class SequenceSpan:
+    """Represents a list of sequence number spans (beginning and ending pairs)"""
+    
+    def __init__(self, spans: Optional[List[Tuple[int, int]]] = None):
+        """Initialize with list of (begin, end) tuples or default to full 8-byte span
+        
+        Spans are automatically sorted by their begin value to ensure lowest sequences
+        are at the front of the list.
+        """
+        if spans is None:
+            # Default to complete 8-byte span: 0 to 2^64 - 1
+            self.spans = [(0, (2**64) - 1)]
+        else:
+            # Sort spans by begin value to maintain numerical order
+            self.spans = sorted(spans, key=lambda x: x[0])
+        # Track the maximum sequence number returned by get_lowest()
+        # and how many times get_lowest() returned a sequence that did
+        # not increase that maximum.
+        self.max_lowest_returned = None  # type: Optional[int]
+        self.get_lowest_non_increase_count = 0
+    
+    def get_spans(self) -> List[Tuple[int, int]]:
+        """Return the list of spans"""
+        return self.spans
+    
+    def to_binary(self) -> bytes:
+        """Convert spans to binary representation"""
+        # Each span is two 8-byte unsigned integers (begin, end)
+        # Format: number of spans (4 bytes) followed by span pairs
+        result = struct.pack('>I', len(self.spans))  # 4-byte unsigned int for count
+        for begin, end in self.spans:
+            result += struct.pack('>QQ', begin, end)  # Two 8-byte unsigned long longs
+        return result
+    
+    @classmethod
+    def from_binary(cls, binary_data: bytes) -> 'SequenceSpan':
+        """Create SequenceSpan from binary representation"""
+        if len(binary_data) < 4:
+            raise ValueError('Binary data too short for SequenceSpan')
+        
+        # Read span count (4 bytes)
+        span_count = struct.unpack('>I', binary_data[0:4])[0]
+        
+        # Each span is 16 bytes (two 8-byte unsigned long longs)
+        expected_len = 4 + (span_count * 16)
+        if len(binary_data) < expected_len:
+            raise ValueError(f'Binary data too short: expected {expected_len}, got {len(binary_data)}')
+        
+        spans = []
+        offset = 4
+        for i in range(span_count):
+            begin, end = struct.unpack('>QQ', binary_data[offset:offset+16])
+            spans.append((begin, end))
+            offset += 16
+        
+        return cls(spans)
+    
+    def get_lowest(self) -> Optional[int]:
+        """Get and remove the lowest sequence number from spans
+        
+        Since spans are always kept in sorted order (by begin value),
+        the lowest sequence number is always the first value of the first span.
+        """
+        if not self.spans or len(self.spans) == 0:
+            return None
+        
+        # Spans are sorted, so first span has lowest begin value
+        begin, end = self.spans[0]
+        lowest = begin
+        
+        # Update the span
+        if begin == end:
+            # Remove this span entirely
+            self.spans.pop(0)
+        else:
+            # Increment the begin value
+            self.spans[0] = (begin + 1, end)
+        # Update tracking: maximum returned lowest and non-increase count
+        try:
+            if self.max_lowest_returned is None:
+                self.max_lowest_returned = lowest
+            else:
+                if lowest > self.max_lowest_returned:
+                    self.max_lowest_returned = lowest
+                else:
+                    # did not increase the maximum
+                    self.get_lowest_non_increase_count += 1
+        except Exception:
+            # Be conservative: don't let tracking errors break sequence logic
+            pass
+
+        return lowest
+    
+    def remove_seq(self, seq_num: int) -> bool:
+        """Remove a specific sequence number from the spans
+        
+        If the sequence number is in the middle of a span, split it into two spans.
+        For example, removing 8 from span (5, 100) results in spans (5, 7) and (9, 100).
+        
+        Args:
+            seq_num: The sequence number to remove
+            
+        Returns:
+            True if the sequence number was found and removed, False otherwise
+        """
+        # Find which span contains this sequence number
+        for i, (begin, end) in enumerate(self.spans):
+            if begin <= seq_num <= end:
+                # Found the span containing this sequence number
+                
+                if begin == end:
+                    # Span contains only this one number, remove the entire span
+                    self.spans.pop(i)
+                elif seq_num == begin:
+                    # Removing from the beginning, just increment begin
+                    self.spans[i] = (begin + 1, end)
+                elif seq_num == end:
+                    # Removing from the end, just decrement end
+                    self.spans[i] = (begin, end - 1)
+                else:
+                    # Removing from the middle, split into two spans
+                    # First span: from begin to seq_num-1
+                    # Second span: from seq_num+1 to end
+                    self.spans[i] = (begin, seq_num - 1)
+                    self.spans.insert(i + 1, (seq_num + 1, end))
+                    # Spans remain in order since we're splitting within a span
+                
+                return True
+        
+        # Sequence number not found in any span
+        return False
 
 
 class CommHandler:
@@ -30,6 +164,7 @@ class DataSource(CommHandler):
 class Connection:
     def __init__(self, config):
         self.config = config
+        self._established = False
 
     def run_once(self):
         raise NotImplementedError("run_once must be implemented by subclasses")
@@ -42,7 +177,6 @@ class SyncTest(Connection):
     """A simple synchronous test connection for unit/testing purposes."""
     def __init__(self, config):
         super().__init__(config)
-        self._established = False
 
     def run_once(self):
         # minimal action for a sync test connection
@@ -98,6 +232,15 @@ class BittrRt:
                             self.ary_established.append(c)
                     except Exception as e:
                         print(f"Connection establish error: {e}", file=sys.stderr)
+
+
+                for c in list(self.ary_established):
+                    try:
+                        c.run_once()
+                    except Exception as e:
+                        print(f"Connection run_once error: {e}", file=sys.stderr)
+
+
                 # indicate liveliness and sleep
                 print('b', end='', flush=True)
                 time.sleep(0.25)
@@ -207,9 +350,28 @@ def main():
                         config[key.strip()] = value.strip()
     else:
         print(f"Config file not found: {config_path}\n use --create-config to create a new config file")
-    # Initialize BittrRt with loaded config
+    # Override config values with any command-line arguments (CLI wins)
+    cli_arg_map = {
+        "--bind-addr": "bind_addr",
+        "--bind-port": "bind_port",
+        "--port-ranges": "port_ranges",
+        "--port-parallelability": "port_parallelability",
+        "--heartbeat-rate": "heartbeat_rate",
+    }
+    # copy to avoid mutating iter while parsing
+    argv = list(sys.argv)
+    for arg, key in cli_arg_map.items():
+        if arg in argv:
+            idx = argv.index(arg)
+            if idx + 1 < len(argv):
+                config[key] = argv[idx + 1]
+    # Flags without values
+    if "--sync-test" in argv:
+        config["--sync-test"] = True
+
+    # Initialize BittrRt with merged config (file + CLI overrides)
     bittrrt = BittrRt(config)
-    # Start the server main loop (may add test connections via CLI args)
+    # Start the server main loop (may add test connections via config)
     bittrrt.start_server()
 
 if __name__ == "__main__":
