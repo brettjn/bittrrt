@@ -1,5 +1,9 @@
+VERSION = "0.1"
+VERSION_NOTE = "Added Connection/SyncTest, start_server/run_loop, config-based --sync-test, establish handling, graceful shutdown on CTRL+C"
+
 import os
 import sys
+import time
 from termcolor import colored
 
 
@@ -22,10 +26,85 @@ class DataSource(CommHandler):
         # Implement packet handling for data source
         pass
 
+
+class Connection:
+    def __init__(self, config):
+        self.config = config
+
+    def run_once(self):
+        raise NotImplementedError("run_once must be implemented by subclasses")
+
+    def establish(self):
+        raise NotImplementedError("establish must be implemented by subclasses")
+
+
+class SyncTest(Connection):
+    """A simple synchronous test connection for unit/testing purposes."""
+    def __init__(self, config):
+        super().__init__(config)
+        self._established = False
+
+    def run_once(self):
+        # minimal action for a sync test connection
+        print("SyncTest: run_once called")
+
+    def establish(self):
+        # For testing, establish once and return True so it gets moved
+        if not self._established:
+            print("SyncTest: establish successful")
+            self._established = True
+            return True
+        return False
+
 class BittrRt:
     def __init__(self, config):
         self.config = config
         self.port_handler = PortHandler(config)
+        # array of active Connection instances
+        self.ary_connections = []
+        # array of established Connection instances
+        self.ary_established = []
+        # running flag for the main loop
+        self.running = False
+
+    def start_server(self):
+        """Prepare connections (optionally add SyncTest) and start the run loop."""
+        # If --sync-test flag is present in the config, add a SyncTest connection
+        if "--sync-test" in self.config:
+            conn = SyncTest(self.config)
+            self.ary_connections.append(conn)
+        # start the main loop
+        self.run_loop()
+
+    def run_loop(self):
+        """Run a persistent loop calling `establish()` on pending connections.
+
+        Loops while `self.running` is True. Established connections are moved
+        from `ary_connections` to `ary_established`. At the end of each
+        iteration prints 'b' and sleeps 0.25 seconds.
+        """
+        print("Starting run loop...")
+        self.running = True
+        try:
+            while self.running:
+                for c in list(self.ary_connections):
+                    try:
+                        established = c.establish()
+                        if established:
+                            try:
+                                self.ary_connections.remove(c)
+                            except ValueError:
+                                pass
+                            self.ary_established.append(c)
+                    except Exception as e:
+                        print(f"Connection establish error: {e}", file=sys.stderr)
+                # indicate liveliness and sleep
+                print('b', end='', flush=True)
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            print("\nReceived SIGINT, shutting down...", file=sys.stderr)
+            self.running = False
+            sys.exit(0)
 
 class PortHandler:
     def __init__(self, config):
@@ -130,6 +209,8 @@ def main():
         print(f"Config file not found: {config_path}\n use --create-config to create a new config file")
     # Initialize BittrRt with loaded config
     bittrrt = BittrRt(config)
+    # Start the server main loop (may add test connections via CLI args)
+    bittrrt.start_server()
 
 if __name__ == "__main__":
     main()
