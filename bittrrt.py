@@ -2,6 +2,7 @@ VERSION = "0.3"
 VERSION_NOTE = "Added LoopDelay class for managing timed delays in loops"
 
 import os
+import socket
 import sys
 import time
 import struct
@@ -9,14 +10,24 @@ import multiprocessing
 from enum import Enum
 from typing import Optional, List, Tuple, Dict
 from termcolor import colored
+import errno
+from abc import ABC, abstractmethod
 
 ESTABLISH_LOOP_DELAY = 1_000_000  # microseconds
+SYNC_TEST_SLEEP      = 3          # seconds
+ESTABLISH_MAX_TIME   = 5_000      # milliseconds
 
 class PortType(Enum):
     """Port types for client connections"""
     CONTROL = "control"
     UPLOAD = "upload"
     DOWNLOAD = "download"
+
+class CommMsg(Enum):
+    START  = "start"
+    STOP   = "stop"
+    PAUSE  = "pause"
+    RESUME = "resume"
 
 class SequenceSpan:
     """Represents a list of sequence number spans (beginning and ending pairs)"""
@@ -201,6 +212,7 @@ class Connection:
          
         self._established    = False
         self.port_manager    = port_manager
+        self.establish_start = time.perf_counter_ns() // 1_000_000  # milliseconds
         
     def run_once(self):
         raise NotImplementedError("run_once must be implemented by subclasses")
@@ -217,18 +229,32 @@ class SyncTest(Connection):
         self.recv_queues:  Dict[PortType, multiprocessing.Queue]  = None
 
         self.ctrl_handler: Optional[CtrlHandler]                  = None
-        self.up_handler:   Optional[UpHandler]                    = None
-        self.dn_handler:   Optional[DnHandler]                    = None
+        self.upld_handler:   Optional[UpHandler]                  = None
+        self.dnld_handler:   Optional[DnHandler]                  = None
 
-        self.from_handler: multiprocessing.Queue                  = multiprocessing.Queue
+        self.from_handler                                         = multiprocessing.Queue()
 
+        self.sent_start_commands: bool                            = False
+
+    
     def run_once(self):
         # minimal action for a sync test connection
         print("SyncTest: run_once called")
 
     def establish(self):
         # For testing, establish once and return True so it gets moved
+        
+        msg=None
+        try:
+            msg=self.from_handler.get_nowait()
+        except:
+            pass
+
+        if msg:
+            print("SyncTest: received message from handler:", msg)
+
         if not self._established:
+            
             if self.send_queues is None:
                 self.send_queues = {}
                 self.send_queues[PortType.CONTROL]  = multiprocessing.Queue()
@@ -245,6 +271,7 @@ class SyncTest(Connection):
             # Instantiate ctrl_handler if it doesn't exist
             if self.ctrl_handler is None:
                 ctrl_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate CTRL_HANDLER on port {ctrl_port}")
                 if ctrl_port is None:
                     print("SyncTest: Failed to get control port")
                     return False
@@ -255,44 +282,71 @@ class SyncTest(Connection):
                     self.from_handler,
                     self.config
                 )
+                return
             
-            # Instantiate up_handler if it doesn't exist
-            if self.up_handler is None:
+            if not self.ctrl_handler.process.is_alive():
+                print("SyncTest: Control handler process is not alive - removing")
+                self.ctrl_handler = None
+                return False
+            
+            # Instantiate upld_handler if it doesn't exist
+            if self.upld_handler is None:
                 up_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate UP_HANDLER on port {up_port}")
                 if up_port is None:
                     print("SyncTest: Failed to get upload port")
                     return False
-                self.up_handler = UpHandler(
+                self.upld_handler = UpHandler(
                     up_port,
                     self.send_queues,
                     self.recv_queues,
                     self.from_handler,
                     self.config
                 )
+                return
             
-            # Instantiate dn_handler if it doesn't exist
-            if self.dn_handler is None:
+            if not self.upld_handler.process.is_alive():
+                print("SyncTest: Upload handler process is not alive")
+                return False
+            
+            # Instantiate dnld_handler if it doesn't exist
+            if self.dnld_handler is None:
                 dn_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate DN_HANDLER on port {dn_port}")
                 if dn_port is None:
                     print("SyncTest: Failed to get download port")
                     return False
-                self.dn_handler = DnHandler(
+                self.dnld_handler = DnHandler(
                     dn_port,
                     self.send_queues,
                     self.recv_queues,
                     self.from_handler,
                     self.config
                 )
+                return
             
-            print("SyncTest: establish successful")
-            self._established = True
-            return True
+            if not self.dnld_handler.process.is_alive():    
+                print("SyncTest: Download handler process is not alive")
+                return False
+
+            if self.ctrl_handler.process.is_alive() and self.upld_handler.process.is_alive() and self.dnld_handler.process.is_alive():
+                print("SyncTest: All handlers alive")
+                if not self.sent_start_commands:
+                    self.recv_queues[PortType.CONTROL].put(CommMsg.START)
+                    self.recv_queues[PortType.UPLOAD].put(CommMsg.START)
+                    self.recv_queues[PortType.DOWNLOAD].put(CommMsg.START)
+                    self.sent_start_commands = True
+                else:
+                    print("SyncTest: establish successful")
+                    self._established = True
+                    return True
+                
         return False
 
 class BittrRt:
     def __init__(self, config):
         self.config = config
-        self.port_handler = PortHandler(config)
+        #self.port_handler = PortHandler(config)
         # Initialize PortManager before server start so ranges are ready
         try:
             # allow passing an explicit override in the config dict if present
@@ -349,6 +403,13 @@ class BittrRt:
                                 except ValueError:
                                     pass
                                 self.ary_established.append(c)
+                            elif c.establish_start is not None and (time.perf_counter_ns() // 1_000_000) - c.establish_start > ESTABLISH_MAX_TIME:
+                                print("SyncTest: Establish time exceeded")
+                                try:
+                                    self.ary_connections.remove(c)
+                                    c.close()
+                                except ValueError:
+                                    pass
                         except Exception as e:
                             print(f"Connection establish error: {e}", file=sys.stderr)
 
@@ -368,37 +429,154 @@ class BittrRt:
             self.running = False
             sys.exit(0)
 
-class PortHandler:
+
+class PortHandler(ABC):
     def __init__(self, config):
-        self.config = config
+        self.config     = config
+        self.sync_sleep = 0
+
+        if "--sync-test" in self.config:
+            self.sync_sleep = SYNC_TEST_SLEEP
+
+    @abstractmethod
+    def run_in_own_process(self):
+        raise NotImplementedError("PortHandler.run_in_own_process() must be implemented by subclasses")
+
+    @abstractmethod
+    def iter(self):
+        raise NotImplementedError("PortHandler.iter() must be implemented by subclasses")        
+    
+    @abstractmethod
+    def port_type(self):
+        raise NotImplementedError("PortHandler.port_type() must be implemented by subclasses")
+
+    @abstractmethod
+    def handle_message(self, msg):
+        raise NotImplementedError("PortHandler.handle_message() must be implemented by subclasses")
+
+    def run(self):
+        """Main loop for the handler."""
+        try:
+            self.usock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.usock.bind((self.config.get("bind_address", "0.0.0.0"), self.port))
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                print(f"Error: Address {self.config.get('bind_address', '0.0.0.0')}:{self.port} is already in use. Please check running processes.")
+                self.to_comm.put(f"port_in_use:{self.port}")
+                sys.exit(1)
+            else:
+                # Handle other potential OSErrors
+                print(f"An unexpected OSError occurred: {e}")
+        except Exception as e:
+            print(f"Error setting up socket in {self.__class__.__name__}: {e}", file=sys.stderr)
+            return
+        
+        msg_from_comm = self.recv_queue[self.port_type()].get()
+        print(f"{self.__class__.__name__} received initial message from comm queue: {msg_from_comm}")
+        if msg_from_comm==CommMsg.START:
+            try:
+                self.usock.listen()
+            except Exception as e:
+                print(f"Error listening on socket in {self.__class__.__name__}: {e}", file=sys.stderr)
+                return
+            
+            while True:
+                try:
+                    # Process incoming messages
+                    if not self.recv_queue[self.port_type()].empty():
+                        msg = self.recv_queue[self.port_type()].get()
+                        self.handle_message(msg)
+                except Exception as e:
+                    print(f"Error in {self.__class__.__name__} run loop: {e}", file=sys.stderr)
+
+                self.iter()
 
 
 class CtrlHandler(PortHandler):
     """Handler for control port communication"""
-    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, config):
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config):
         super().__init__(config)
-        self.port = port
+
+        self.port       = port
         self.send_queue = send_queue
         self.recv_queue = recv_queue
+        self.to_comm    = to_comm
+
+        self.run_in_own_process()
+    
+    def port_type(self):
+        return(PortType.CONTROL)
+
+    def iter(self):
+        print('(CH)', end='', flush=True)
+        time.sleep(self.sync_sleep)    
+
+    def handle_message(self, msg):
+        """Handle a message received from the queue."""
+        print(f"{self.__class__.__name__} received message: {msg}")
+
+    def run_in_own_process(self):
+        """Run this handler in its own process."""
+        self.process = multiprocessing.Process(target=self.run)
+        self.process.start()
 
 
 class UpHandler(PortHandler):
     """Handler for upload port communication"""
-    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, config):
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config):
         super().__init__(config)
-        self.port = port
+
+        self.port       = port
         self.send_queue = send_queue
         self.recv_queue = recv_queue
+        self.to_comm    = to_comm
+
+        self.run_in_own_process()
+
+    def port_type(self):
+        return(PortType.CONTROL)
+
+    def iter(self):
+        print('(UH)', end='', flush=True)
+        time.sleep(self.sync_sleep)    
+
+    def handle_message(self, msg):
+        """Handle a message received from the queue."""
+        print(f"{self.__class__.__name__} received message: {msg}")
+
+    def run_in_own_process(self):
+        """Run this handler in its own process."""
+        self.process = multiprocessing.Process(target=self.run)
+        self.process.start()
 
 
 class DnHandler(PortHandler):
     """Handler for download port communication"""
-    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, config):
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config):
         super().__init__(config)
-        self.port = port
+
+        self.port       = port
         self.send_queue = send_queue
         self.recv_queue = recv_queue
+        self.to_comm    = to_comm
 
+        self.run_in_own_process()
+
+    def port_type(self):
+        return(PortType.CONTROL)
+
+    def iter(self):
+        print('(DH)', end='', flush=True)
+        time.sleep(self.sync_sleep)    
+
+    def handle_message(self, msg):
+        """Handle a message received from the queue."""
+        print(f"{self.__class__.__name__} received message: {msg}")
+
+    def run_in_own_process(self):
+        """Run this handler in its own process."""
+        self.process = multiprocessing.Process(target=self.run)
+        self.process.start()
 
 class PortManager:
     """Manage available port numbers using SequenceSpan.
