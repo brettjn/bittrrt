@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 
 ESTABLISH_LOOP_DELAY = 1_000_000  # microseconds
 SYNC_TEST_SLEEP      = 3          # seconds
-ESTABLISH_MAX_TIME   = 5_000      # milliseconds
+ESTABLISH_MAX_TIME   = 10_000      # milliseconds
 
 class PortType(Enum):
     """Port types for client connections"""
@@ -534,7 +534,7 @@ class UpHandler(PortHandler):
         self.run_in_own_process()
 
     def port_type(self):
-        return(PortType.CONTROL)
+        return(PortType.UPLOAD)
 
     def iter(self):
         print('(UH)', end='', flush=True)
@@ -563,7 +563,7 @@ class DnHandler(PortHandler):
         self.run_in_own_process()
 
     def port_type(self):
-        return(PortType.CONTROL)
+        return(PortType.DOWNLOAD)
 
     def iter(self):
         print('(DH)', end='', flush=True)
