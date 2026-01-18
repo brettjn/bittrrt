@@ -1,12 +1,22 @@
-VERSION = "0.2"
-VERSION_NOTE = "Added SequenceSpan class with binary serialization, fixed missing imports (struct, typing), config creation tests"
+VERSION = "0.3"
+VERSION_NOTE = "Added LoopDelay class for managing timed delays in loops"
 
 import os
 import sys
 import time
 import struct
-from typing import Optional, List, Tuple
+import multiprocessing
+from enum import Enum
+from typing import Optional, List, Tuple, Dict
 from termcolor import colored
+
+ESTABLISH_LOOP_DELAY = 1_000_000  # microseconds
+
+class PortType(Enum):
+    """Port types for client connections"""
+    CONTROL = "control"
+    UPLOAD = "upload"
+    DOWNLOAD = "download"
 
 class SequenceSpan:
     """Represents a list of sequence number spans (beginning and ending pairs)"""
@@ -141,6 +151,30 @@ class SequenceSpan:
         return False
 
 
+class LoopDelay:
+    """A class to manage delays in loops, returning True when delay has passed."""
+
+    def __init__(self, delay_us: int):
+        """Initialize with delay in microseconds."""
+        self.delay_us = delay_us
+        self.last_time = None
+
+    def is_time_to_do_it(self) -> bool:
+        """Check if enough time has passed since last call.
+        
+        Returns True on first call or when delay has been reached.
+        Saves timestamp and returns False if delay not reached.
+        """
+        current_time = time.perf_counter_ns() // 1000  # microseconds
+        if self.last_time is None:
+            self.last_time = current_time
+            return True
+        if current_time - self.last_time >= self.delay_us:
+            self.last_time = current_time
+            return True
+        return False
+
+
 class CommHandler:
     def handle_packets(self, ary_packets):
         raise NotImplementedError("handle_packets must be implemented by subclasses")
@@ -162,10 +196,12 @@ class DataSource(CommHandler):
 
 
 class Connection:
-    def __init__(self, config):
-        self.config = config
-        self._established = False
-
+    def __init__(self, config, port_manager):
+        self.config          = config
+         
+        self._established    = False
+        self.port_manager    = port_manager
+        
     def run_once(self):
         raise NotImplementedError("run_once must be implemented by subclasses")
 
@@ -175,8 +211,16 @@ class Connection:
 
 class SyncTest(Connection):
     """A simple synchronous test connection for unit/testing purposes."""
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, port_manager):
+        super().__init__(config, port_manager)
+        self.send_queues:  Dict[PortType, multiprocessing.Queue]  = None
+        self.recv_queues:  Dict[PortType, multiprocessing.Queue]  = None
+
+        self.ctrl_handler: Optional[CtrlHandler]                  = None
+        self.up_handler:   Optional[UpHandler]                    = None
+        self.dn_handler:   Optional[DnHandler]                    = None
+
+        self.from_handler: multiprocessing.Queue                  = multiprocessing.Queue
 
     def run_once(self):
         # minimal action for a sync test connection
@@ -185,6 +229,61 @@ class SyncTest(Connection):
     def establish(self):
         # For testing, establish once and return True so it gets moved
         if not self._established:
+            if self.send_queues is None:
+                self.send_queues = {}
+                self.send_queues[PortType.CONTROL]  = multiprocessing.Queue()
+                self.send_queues[PortType.UPLOAD]   = multiprocessing.Queue()
+                self.send_queues[PortType.DOWNLOAD] = multiprocessing.Queue()
+
+            if self.recv_queues is None:
+                self.recv_queues = {}
+                self.recv_queues[PortType.CONTROL]  = multiprocessing.Queue()
+                self.recv_queues[PortType.UPLOAD]   = multiprocessing.Queue()
+                self.recv_queues[PortType.DOWNLOAD] = multiprocessing.Queue()
+
+
+            # Instantiate ctrl_handler if it doesn't exist
+            if self.ctrl_handler is None:
+                ctrl_port = self.port_manager.get_next_port()
+                if ctrl_port is None:
+                    print("SyncTest: Failed to get control port")
+                    return False
+                self.ctrl_handler = CtrlHandler(
+                    ctrl_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config
+                )
+            
+            # Instantiate up_handler if it doesn't exist
+            if self.up_handler is None:
+                up_port = self.port_manager.get_next_port()
+                if up_port is None:
+                    print("SyncTest: Failed to get upload port")
+                    return False
+                self.up_handler = UpHandler(
+                    up_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config
+                )
+            
+            # Instantiate dn_handler if it doesn't exist
+            if self.dn_handler is None:
+                dn_port = self.port_manager.get_next_port()
+                if dn_port is None:
+                    print("SyncTest: Failed to get download port")
+                    return False
+                self.dn_handler = DnHandler(
+                    dn_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config
+                )
+            
             print("SyncTest: establish successful")
             self._established = True
             return True
@@ -194,6 +293,13 @@ class BittrRt:
     def __init__(self, config):
         self.config = config
         self.port_handler = PortHandler(config)
+        # Initialize PortManager before server start so ranges are ready
+        try:
+            # allow passing an explicit override in the config dict if present
+            pr = config.get("port_ranges") if isinstance(config, dict) else None
+            self.port_manager = PortManager(config, port_ranges_arg=pr)
+        except Exception:
+            self.port_manager = None
         # array of active Connection instances
         self.ary_connections = []
         # array of established Connection instances
@@ -205,7 +311,15 @@ class BittrRt:
         """Prepare connections (optionally add SyncTest) and start the run loop."""
         # If --sync-test flag is present in the config, add a SyncTest connection
         if "--sync-test" in self.config:
-            conn = SyncTest(self.config)
+            # Ensure we have enough available ports to create a communication instance
+            pm = getattr(self, 'port_manager', None)
+            if pm is None:
+                print("Error: PortManager not initialized; cannot start SyncTest.", file=sys.stderr)
+                sys.exit(1)
+            if pm.get_available_port_count() < 3:
+                print("Error: Not enough available ports for SyncTest (need >=3).", file=sys.stderr)
+                sys.exit(1)
+            conn = SyncTest(self.config, self.port_manager)
             self.ary_connections.append(conn)
         # start the main loop
         self.run_loop()
@@ -220,25 +334,30 @@ class BittrRt:
         print("Starting run loop...")
         self.running = True
         try:
+
+            elp  = LoopDelay(ESTABLISH_LOOP_DELAY)
+            edlp = LoopDelay(ESTABLISH_LOOP_DELAY)
+
             while self.running:
-                for c in list(self.ary_connections):
-                    try:
-                        established = c.establish()
-                        if established:
-                            try:
-                                self.ary_connections.remove(c)
-                            except ValueError:
-                                pass
-                            self.ary_established.append(c)
-                    except Exception as e:
-                        print(f"Connection establish error: {e}", file=sys.stderr)
+                if elp.is_time_to_do_it():
+                    for c in list(self.ary_connections):
+                        try:
+                            established = c.establish()
+                            if established:
+                                try:
+                                    self.ary_connections.remove(c)
+                                except ValueError:
+                                    pass
+                                self.ary_established.append(c)
+                        except Exception as e:
+                            print(f"Connection establish error: {e}", file=sys.stderr)
 
-
-                for c in list(self.ary_established):
-                    try:
-                        c.run_once()
-                    except Exception as e:
-                        print(f"Connection run_once error: {e}", file=sys.stderr)
+                if edlp.is_time_to_do_it():
+                    for c in list(self.ary_established):
+                        try:
+                            c.run_once()
+                        except Exception as e:
+                            print(f"Connection run_once error: {e}", file=sys.stderr)
 
 
                 # indicate liveliness and sleep
@@ -252,6 +371,140 @@ class BittrRt:
 class PortHandler:
     def __init__(self, config):
         self.config = config
+
+
+class CtrlHandler(PortHandler):
+    """Handler for control port communication"""
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, config):
+        super().__init__(config)
+        self.port = port
+        self.send_queue = send_queue
+        self.recv_queue = recv_queue
+
+
+class UpHandler(PortHandler):
+    """Handler for upload port communication"""
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, config):
+        super().__init__(config)
+        self.port = port
+        self.send_queue = send_queue
+        self.recv_queue = recv_queue
+
+
+class DnHandler(PortHandler):
+    """Handler for download port communication"""
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, config):
+        super().__init__(config)
+        self.port = port
+        self.send_queue = send_queue
+        self.recv_queue = recv_queue
+
+
+class PortManager:
+    """Manage available port numbers using SequenceSpan.
+
+    Parses a port ranges string (format: "start-end,start-end" or single ports)
+    from `config['port_ranges']` or an explicit argument and instantiates
+    a `SequenceSpan` with the resulting spans.
+    """
+    def __init__(self, config, port_ranges_arg: str = None):
+        self.config = config
+        # Determine effective ranges string: explicit arg wins over config
+        ranges_str = port_ranges_arg if port_ranges_arg is not None else config.get("port_ranges")
+        if not ranges_str:
+            # No ranges provided — initialize with an empty span list
+            spans = []
+        else:
+            spans = self._parse_ranges(ranges_str)
+
+        # Create a SequenceSpan from parsed spans
+        self.sequence_span = SequenceSpan(spans)
+
+    def _parse_ranges(self, ranges_str: str):
+        """Parse a comma-separated ranges string into a list of (begin,end) tuples."""
+        spans = []
+        for part in ranges_str.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '-' in part:
+                a, b = part.split('-', 1)
+                spans.append((int(a), int(b)))
+            else:
+                # single port
+                p = int(part)
+                spans.append((p, p))
+        return spans
+
+    def get_next_port(self):
+        """Return the next available port (consumes it) or None if none left."""
+        return self.sequence_span.get_lowest()
+
+    def get_spans(self):
+        """Return current spans list."""
+        return self.sequence_span.get_spans()
+
+    def release_port(self, port: int) -> bool:
+        """Return a previously consumed port back into the available spans.
+
+        Returns True if the port was added back (or merged), False if the
+        port was already available.
+        """
+        spans = self.sequence_span.spans
+        # If there are no spans, create a new one for this port
+        if not spans:
+            self.sequence_span.spans = [(port, port)]
+            return True
+
+        # If port is before the first span
+        if port < spans[0][0] - 1:
+            spans.insert(0, (port, port))
+            return True
+        if port == spans[0][0] - 1:
+            # extend the first span backward
+            spans[0] = (port, spans[0][1])
+            return True
+
+        # Iterate to find insertion/merge point
+        for i in range(len(spans)):
+            begin, end = spans[i]
+            if begin <= port <= end:
+                # already available
+                return False
+            if port == end + 1:
+                # extend current span forward and possibly merge with next
+                spans[i] = (begin, port)
+                # merge with next if adjacent
+                if i + 1 < len(spans) and spans[i+1][0] == port + 1:
+                    spans[i] = (begin, spans[i+1][1])
+                    spans.pop(i+1)
+                return True
+            if port < begin - 1:
+                # insert as a separate span before current
+                spans.insert(i, (port, port))
+                return True
+            if port == begin - 1:
+                # extend current span backward
+                spans[i] = (port, end)
+                return True
+
+        # If we reach here, port is after the last span
+        last_begin, last_end = spans[-1]
+        if port == last_end + 1:
+            spans[-1] = (last_begin, port)
+            return True
+        if port > last_end + 1:
+            spans.append((port, port))
+            return True
+
+        return False
+
+    def get_available_port_count(self) -> int:
+        """Return the total number of available ports across all spans."""
+        total = 0
+        for begin, end in self.sequence_span.spans:
+            total += (end - begin + 1)
+        return total
 
 
 def main():
