@@ -1,5 +1,5 @@
-VERSION = "0.3"
-VERSION_NOTE = "Added LoopDelay class for managing timed delays in loops"
+VERSION = "0.4"
+VERSION_NOTE = "Fixed port_type() in UpHandler/DnHandler, implemented SyncTest.close() with graceful subprocess shutdown, improved KeyboardInterrupt handling"
 
 import os
 import socket
@@ -343,6 +343,38 @@ class SyncTest(Connection):
                 
         return False
 
+    def close(self):
+        """Shutdown all handler subprocesses by sending STOP messages and waiting for them to terminate."""
+        handlers = [
+            (self.ctrl_handler, PortType.CONTROL, "Control"),
+            (self.upld_handler, PortType.UPLOAD, "Upload"),
+            (self.dnld_handler, PortType.DOWNLOAD, "Download")
+        ]
+        
+        # Send STOP messages to all alive handlers
+        for handler, port_type, name in handlers:
+            if handler is not None and handler.process.is_alive():
+                print(f"SyncTest: Sending STOP to {name} handler")
+                self.recv_queues[port_type].put(CommMsg.STOP)
+        
+        # Wait for all processes to terminate
+        for handler, port_type, name in handlers:
+            if handler is not None:
+                if handler.process.is_alive():
+                    print(f"SyncTest: Waiting for {name} handler to terminate...")
+                    handler.process.join(timeout=5.0)
+                    if handler.process.is_alive():
+                        print(f"SyncTest: {name} handler did not terminate, forcing termination")
+                        handler.process.terminate()
+                        handler.process.join(timeout=1.0)
+                        if handler.process.is_alive():
+                            print(f"SyncTest: {name} handler still alive, killing")
+                            handler.process.kill()
+                else:
+                    print(f"SyncTest: {name} handler already terminated")
+        
+        print("SyncTest: All handlers shut down")
+
 class BittrRt:
     def __init__(self, config):
         self.config = config
@@ -427,6 +459,12 @@ class BittrRt:
         except KeyboardInterrupt:
             print("\nReceived SIGINT, shutting down...", file=sys.stderr)
             self.running = False
+            # Cleanly shutdown all connections
+            for c in list(self.ary_established) + list(self.ary_connections):
+                try:
+                    c.close()
+                except Exception as e:
+                    print(f"Error closing connection: {e}", file=sys.stderr)
             sys.exit(0)
 
 
@@ -480,16 +518,30 @@ class PortHandler(ABC):
                 print(f"Error listening on socket in {self.__class__.__name__}: {e}", file=sys.stderr)
                 return
             
-            while True:
-                try:
-                    # Process incoming messages
-                    if not self.recv_queue[self.port_type()].empty():
-                        msg = self.recv_queue[self.port_type()].get()
-                        self.handle_message(msg)
-                except Exception as e:
-                    print(f"Error in {self.__class__.__name__} run loop: {e}", file=sys.stderr)
+            running = True
+            try:
+                while running:
+                    try:
+                        # Process incoming messages
+                        if not self.recv_queue[self.port_type()].empty():
+                            msg = self.recv_queue[self.port_type()].get()
+                            should_continue = self.handle_message(msg)
+                            if should_continue is False:
+                                running = False
+                                break
+                    except Exception as e:
+                        print(f"Error in {self.__class__.__name__} run loop: {e}", file=sys.stderr)
 
-                self.iter()
+                    self.iter()
+            except KeyboardInterrupt:
+                # Gracefully handle CTRL-C in subprocess
+                pass
+            
+            print(f"{self.__class__.__name__} shutting down")
+            try:
+                self.usock.close()
+            except:
+                pass
 
 
 class CtrlHandler(PortHandler):
@@ -512,8 +564,11 @@ class CtrlHandler(PortHandler):
         time.sleep(self.sync_sleep)    
 
     def handle_message(self, msg):
-        """Handle a message received from the queue."""
+        """Handle a message received from the queue. Returns False to stop the loop."""
         print(f"{self.__class__.__name__} received message: {msg}")
+        if msg == CommMsg.STOP:
+            return False
+        return True
 
     def run_in_own_process(self):
         """Run this handler in its own process."""
@@ -541,8 +596,11 @@ class UpHandler(PortHandler):
         time.sleep(self.sync_sleep)    
 
     def handle_message(self, msg):
-        """Handle a message received from the queue."""
+        """Handle a message received from the queue. Returns False to stop the loop."""
         print(f"{self.__class__.__name__} received message: {msg}")
+        if msg == CommMsg.STOP:
+            return False
+        return True
 
     def run_in_own_process(self):
         """Run this handler in its own process."""
@@ -570,8 +628,11 @@ class DnHandler(PortHandler):
         time.sleep(self.sync_sleep)    
 
     def handle_message(self, msg):
-        """Handle a message received from the queue."""
+        """Handle a message received from the queue. Returns False to stop the loop."""
         print(f"{self.__class__.__name__} received message: {msg}")
+        if msg == CommMsg.STOP:
+            return False
+        return True
 
     def run_in_own_process(self):
         """Run this handler in its own process."""
