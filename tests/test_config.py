@@ -210,6 +210,7 @@ class TestCommandLineArguments(unittest.TestCase):
         
         test_args = [
             "bittrrt.py",
+            "--server",
             "--bind-addr", "10.0.0.1",
             "--bind-port", "9999"
         ]
@@ -223,7 +224,7 @@ class TestCommandLineArguments(unittest.TestCase):
                     mock_start.assert_called_once()
         
         # Verify the config was properly merged (we'll test via BittrRt initialization)
-        test_args = ["bittrrt.py", "--bind-addr", "10.0.0.1"]
+        test_args = ["bittrrt.py", "--server", "--bind-addr", "10.0.0.1"]
         with patch.object(sys, 'argv', test_args):
             with patch('os.path.expanduser', return_value=self.config_path):
                 with patch.object(bittrrt.BittrRt, 'start_server'):
@@ -251,7 +252,7 @@ class TestCommandLineArguments(unittest.TestCase):
             f.write("bind_addr=0.0.0.0\n")
             f.write("bind_port=6711\n")
         
-        test_args = ["bittrrt.py", "--sync-test"]
+        test_args = ["bittrrt.py", "--server", "--sync-test"]
         
         with patch.object(sys, 'argv', test_args):
             with patch('os.path.expanduser', return_value=self.config_path):
@@ -272,7 +273,7 @@ class TestCommandLineArguments(unittest.TestCase):
 
     def test_no_config_file_warning(self):
         """Test that a warning is shown when config file doesn't exist."""
-        test_args = ["bittrrt.py"]
+        test_args = ["bittrrt.py", "--server"]
         
         captured_stdout = StringIO()
         with patch.object(sys, 'argv', test_args):
@@ -298,6 +299,7 @@ class TestCommandLineArguments(unittest.TestCase):
         
         test_args = [
             "bittrrt.py",
+            "--server",
             "--bind-addr", "172.16.0.1",
             "--bind-port", "7777",
             "--port-ranges", "7778-7788",
@@ -325,6 +327,22 @@ class TestCommandLineArguments(unittest.TestCase):
                     self.assertEqual(config["port_ranges"], "7778-7788")
                     self.assertEqual(config["port_parallelability"], "PROCESS")
                     self.assertEqual(config["heartbeat_rate"], "2000")
+
+                def test_unknown_dash_argument_errors(self):
+                    """Test that unknown dash-style arguments cause an error and exit."""
+                    test_args = ["bittrrt.py", "-x"]
+
+                    captured_stderr = StringIO()
+                    with patch.object(sys, 'argv', test_args):
+                        with patch('os.path.expanduser', return_value=self.config_path):
+                            with patch('sys.stderr', captured_stderr):
+                                with self.assertRaises(SystemExit) as cm:
+                                    bittrt.main()
+                                # Expect non-zero exit for unknown arg
+                                self.assertNotEqual(cm.exception.code, 0)
+
+                    stderr_output = captured_stderr.getvalue()
+                    self.assertIn("Error: Unknown argument '-x'", stderr_output)
 
 
 if __name__ == '__main__':

@@ -12,10 +12,177 @@ from typing import Optional, List, Tuple, Dict
 from termcolor import colored
 import errno
 from abc import ABC, abstractmethod
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+import json
+import base64
 
 ESTABLISH_LOOP_DELAY = 1_000_000  # microseconds
 SYNC_TEST_SLEEP      = 3          # seconds
-ESTABLISH_MAX_TIME   = 10_000      # milliseconds
+ESTABLISH_MAX_TIME   = 20_000     # milliseconds
+MAIN_RECV_TIMEOUT    = 250_000    # microseconds
+MAIN_MAX_PACKETS     = 100        # maximum number of packets to receive in main loop
+NEGOTIATION_DELAY    = 100        # milliseconds
+NEGOTIATION_REPEAT   = 50         # number of attempts
+
+NET_OBS_KEY = 'OdiXEOXdvwgWfIizYjdEguhN-IP7eyqp9oITq_0MiBs='
+
+
+class DoCrypt:
+    """Simple wrapper around Fernet for encrypting/decrypting text.
+
+    Initialize with a Fernet key (bytes or str). Methods accept and return
+    unicode strings: `fencrypt(text)` -> token string, `fdecrypt(token)` -> text.
+    """
+
+    def __init__(self, key):
+        # Accept either a str or bytes key
+        if isinstance(key, str):
+            key = key.encode('utf-8')
+        if not isinstance(key, (bytes, bytearray)):
+            raise TypeError('Fernet key must be bytes or str')
+        self._fernet = Fernet(key)
+
+    def fencrypt(self, text: str) -> str:
+        """Encrypt `text` and return a token string.
+
+        Args:
+            text: plaintext to encrypt
+
+        Returns:
+            URL-safe base64-encoded token as `str`
+        """
+        if not isinstance(text, str):
+            raise TypeError('text must be a str')
+        token = self._fernet.encrypt(text.encode('utf-8'))
+        return token.decode('utf-8')
+
+    def fdecrypt(self, token: str) -> str:
+        """Decrypt `token` (str) and return plaintext string.
+
+        Raises `ValueError` if token is invalid or cannot be decrypted.
+        """
+        if not isinstance(token, str):
+            raise TypeError('token must be a str')
+        try:
+            data = self._fernet.decrypt(token.encode('utf-8'))
+        except InvalidToken as e:
+            raise ValueError('Invalid token or decryption failed') from e
+        return data.decode('utf-8')
+
+
+class CommEncryptor:
+    """Generate an X25519 key pair for Diffie-Hellman key exchange.
+
+    On instantiation this generates a new private/public key pair and
+    exposes the public key as raw bytes via the `public_key_bytes` attribute.
+
+    After receiving the peer's public key, call `derive_shared_secret()` to
+    perform the key exchange and set up ChaCha20Poly1305 encryption.
+
+    Example:
+        ce = CommEncryptor()
+        pub = ce.public_key_bytes  # 32 bytes
+        ce.derive_shared_secret(peer_public_key_bytes)
+        ciphertext = ce.encrypt(b"hello")
+        plaintext = ce.decrypt(ciphertext)
+    """
+
+    def __init__(self):
+        # Generate private/public key pair
+        self.private_key = x25519.X25519PrivateKey.generate()
+        self.public_key = self.private_key.public_key()
+
+        # Public key as raw bytes (32 bytes)
+        self.public_key_bytes = self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+        
+        # ChaCha20Poly1305 cipher (set after derive_shared_secret)
+        self.cipher = None
+
+    def get_public_key(self) -> bytes:
+        """Return the public key as raw bytes (32 bytes)."""
+        return self.public_key_bytes
+    
+    def derive_shared_secret(self, peer_public_key_bytes: bytes) -> None:
+        """Perform Diffie-Hellman key exchange and derive shared secret.
+        
+        Args:
+            peer_public_key_bytes: The peer's X25519 public key (32 bytes)
+        """
+        # Load peer's public key from raw bytes
+        peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_key_bytes)
+        
+        # Perform DH exchange to get shared secret
+        shared_secret = self.private_key.exchange(peer_public_key)
+        
+        # Derive a 32-byte key from the shared secret using HKDF
+        derived_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b'bittrrt-chacha20poly1305',
+        ).derive(shared_secret)
+        
+        # Initialize ChaCha20Poly1305 cipher with derived key
+        self.cipher = ChaCha20Poly1305(derived_key)
+    
+    def encrypt(self, plaintext: bytes, associated_data: bytes = b'') -> bytes:
+        """Encrypt plaintext using ChaCha20Poly1305.
+        
+        Args:
+            plaintext: Data to encrypt
+            associated_data: Optional associated data (authenticated but not encrypted)
+            
+        Returns:
+            Nonce (12 bytes) + ciphertext + tag (16 bytes)
+        """
+        if self.cipher is None:
+            raise RuntimeError("Must call derive_shared_secret() before encrypting")
+        
+        # Generate a random 12-byte nonce
+        nonce = os.urandom(12)
+        
+        # Encrypt and authenticate
+        ciphertext = self.cipher.encrypt(nonce, plaintext, associated_data)
+        
+        # Return nonce + ciphertext (ciphertext includes the auth tag)
+        return nonce + ciphertext
+    
+    def decrypt(self, encrypted_data: bytes, associated_data: bytes = b'') -> bytes:
+        """Decrypt data encrypted with ChaCha20Poly1305.
+        
+        Args:
+            encrypted_data: Nonce (12 bytes) + ciphertext + tag
+            associated_data: Optional associated data (must match encryption)
+            
+        Returns:
+            Decrypted plaintext
+            
+        Raises:
+            ValueError: If authentication fails or data is invalid
+        """
+        if self.cipher is None:
+            raise RuntimeError("Must call derive_shared_secret() before decrypting")
+        
+        if len(encrypted_data) < 12:
+            raise ValueError("Encrypted data too short (missing nonce)")
+        
+        # Extract nonce and ciphertext
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
+        
+        # Decrypt and verify authentication
+        try:
+            plaintext = self.cipher.decrypt(nonce, ciphertext, associated_data)
+            return plaintext
+        except Exception as e:
+            raise ValueError(f"Decryption failed: {e}")
 
 class PortType(Enum):
     """Port types for client connections"""
@@ -395,6 +562,24 @@ class BittrRt:
 
     def start_server(self):
         """Prepare connections (optionally add SyncTest) and start the run loop."""
+        # Setup UDP socket on bind_addr and bind_port
+        bind_addr = self.config.get("bind_addr", "0.0.0.0")
+        bind_port = int(self.config.get("bind_port", 6711))
+        
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.bind((bind_addr, bind_port))
+            # Set socket to non-blocking mode for timeout handling
+            timeout_seconds = MAIN_RECV_TIMEOUT / 1_000_000.0  # convert microseconds to seconds
+            self.socket.settimeout(timeout_seconds)
+            print(f"BittrRt: UDP socket bound to {bind_addr}:{bind_port}")
+        except OSError as e:
+            print(f"Error: Failed to create UDP socket on {bind_addr}:{bind_port}: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error: Unexpected error setting up UDP socket: {e}", file=sys.stderr)
+            sys.exit(1)
+        
         # If --sync-test flag is present in the config, add a SyncTest connection
         if "--sync-test" in self.config:
             # Ensure we have enough available ports to create a communication instance
@@ -425,6 +610,32 @@ class BittrRt:
             edlp = LoopDelay(ESTABLISH_LOOP_DELAY)
 
             while self.running:
+                # Try to receive UDP packets
+                ary_packets = []
+                try:
+                    try:
+                        timeout_seconds = MAIN_RECV_TIMEOUT / 1_000_000.0  # convert microseconds to seconds
+                        self.socket.settimeout(timeout_seconds)
+                        data, addr = self.socket.recvfrom(65535)  # max UDP packet size
+                        ary_packets.append((data, addr))
+                        self.socket.settimeout(0.0)
+                        while len(ary_packets) < MAIN_MAX_PACKETS:
+                            data, addr = self.socket.recvfrom(65535)  # max UDP packet size
+                            ary_packets.append((data, addr))
+                    except socket.timeout:
+                        # Timeout reached, no more packets available
+                        pass
+                    except BlockingIOError:
+                        # No data available (shouldn't happen with timeout set)
+                        pass
+                except Exception as e:
+                    print(f"Error receiving UDP packets: {e}", file=sys.stderr)
+                
+                # Process received packets (placeholder for future implementation)
+                if ary_packets:
+                    print(f"\nReceived {len(ary_packets)} UDP packet(s)")
+                    self._handle_packets(ary_packets)
+                
                 if elp.is_time_to_do_it():
                     for c in list(self.ary_connections):
                         try:
@@ -455,10 +666,15 @@ class BittrRt:
 
                 # indicate liveliness and sleep
                 print('b', end='', flush=True)
-                time.sleep(0.25)
+                #time.sleep(0.25)
         except KeyboardInterrupt:
             print("\nReceived SIGINT, shutting down...", file=sys.stderr)
             self.running = False
+            # Close the UDP socket
+            try:
+                self.socket.close()
+            except Exception as e:
+                print(f"Error closing UDP socket: {e}", file=sys.stderr)
             # Cleanly shutdown all connections
             for c in list(self.ary_established) + list(self.ary_connections):
                 try:
@@ -466,6 +682,41 @@ class BittrRt:
                 except Exception as e:
                     print(f"Error closing connection: {e}", file=sys.stderr)
             sys.exit(0)
+
+    def _handle_packets(self, ary_packets):
+        """Handle incoming UDP packets, including connection negotiation."""
+        dc = DoCrypt(NET_OBS_KEY)
+        
+        for data, addr in ary_packets:
+            try:
+                # Decrypt the packet
+                token = data.decode('utf-8')
+                payload_json = dc.fdecrypt(token)
+                payload = json.loads(payload_json)
+                
+                # Handle "connect" command
+                if payload.get("cmd") == "connect" and "pubkey" in payload:
+                    client_pubkey_b64 = payload["pubkey"]
+                    client_pubkey_bytes = base64.urlsafe_b64decode(client_pubkey_b64)
+                    
+                    # Generate server's key pair
+                    ce = CommEncryptor()
+                    server_pubkey_bytes = ce.get_public_key()
+                    server_pubkey_b64 = base64.urlsafe_b64encode(server_pubkey_bytes).decode('ascii')
+                    
+                    # Perform DH exchange on server side
+                    ce.derive_shared_secret(client_pubkey_bytes)
+                    
+                    # Send "connected" response
+                    response = {"cmd": "connected", "pubkey": server_pubkey_b64}
+                    response_json = json.dumps(response)
+                    response_token = dc.fencrypt(response_json)
+                    
+                    self.socket.sendto(response_token.encode('utf-8'), addr)
+                    print(f"\nNegotiated secure channel with client {addr}")
+                    
+            except Exception as e:
+                print(f"Error handling packet from {addr}: {e}", file=sys.stderr)
 
 
 class PortHandler(ABC):
@@ -746,6 +997,104 @@ class PortManager:
         return total
 
 
+class BittrRtClient:
+    """Client helper to send an encrypted UDP 'connect' message to server.
+
+    Usage: instantiate with the `argv` list (typically `sys.argv`) and call
+    `run()` which returns True on success, False on failure.
+    """
+
+    def __init__(self, argv, net_obs_key=NET_OBS_KEY):
+        self.argv = list(argv)
+        self.net_obs_key = net_obs_key
+
+    def _parse_target(self):
+        address = "127.0.0.1"
+        port = 6711
+        addr_arg = None
+        for arg in self.argv[1:]:
+            if not isinstance(arg, str):
+                continue
+            if not arg.startswith('-'):
+                addr_arg = arg
+                break
+        if addr_arg:
+            if ':' in addr_arg:
+                parts = addr_arg.split(':', 1)
+                address = parts[0] if parts[0] else address
+                try:
+                    port = int(parts[1])
+                except Exception:
+                    # keep default port on parse error
+                    pass
+            else:
+                address = addr_arg
+        return address, port
+
+    def run(self) -> bool:
+        address, port = self._parse_target()
+        # Generate an X25519 keypair and get the public key bytes
+        ce = CommEncryptor()
+        pubkey_bytes = ce.get_public_key()
+        # Encode public key bytes as URL-safe base64 string for JSON transport
+        pubkey_b64 = base64.urlsafe_b64encode(pubkey_bytes).decode('ascii')
+
+        payload = {"cmd": "connect", "pubkey": pubkey_b64}
+        payload_json = json.dumps(payload)
+
+        try:
+            dc = DoCrypt(self.net_obs_key)
+            token = dc.fencrypt(payload_json)
+        except Exception as e:
+            print(f"Error: failed to encrypt payload: {e}", file=sys.stderr)
+            return False
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(NEGOTIATION_DELAY / 1000.0)  # Convert ms to seconds
+            
+            # Send connect repeatedly and wait for response
+            for attempt in range(NEGOTIATION_REPEAT):
+                sock.sendto(token.encode('utf-8'), (address, port))
+                
+                # Try to receive a response
+                try:
+                    response_data, server_addr = sock.recvfrom(4096)
+                    
+                    # Decrypt the response
+                    response_token = response_data.decode('utf-8')
+                    response_json = dc.fdecrypt(response_token)
+                    response = json.loads(response_json)
+                    
+                    # Check if it's a "connected" response
+                    if response.get("cmd") == "connected" and "pubkey" in response:
+                        server_pubkey_b64 = response["pubkey"]
+                        server_pubkey_bytes = base64.urlsafe_b64decode(server_pubkey_b64)
+                        
+                        # Perform DH exchange
+                        ce.derive_shared_secret(server_pubkey_bytes)
+                        
+                        print(f"Successfully connected to {address}:{port}")
+                        print(f"Established secure channel with server")
+                        sock.close()
+                        return True
+                    
+                except socket.timeout:
+                    # No response yet, continue trying
+                    continue
+                except Exception as e:
+                    print(f"Error receiving/decrypting response: {e}", file=sys.stderr)
+                    continue
+            
+            sock.close()
+            print(f"Failed to establish connection after {NEGOTIATION_REPEAT} attempts", file=sys.stderr)
+            return False
+            
+        except Exception as e:
+            print(f"Error sending UDP packet to {address}:{port}: {e}", file=sys.stderr)
+            return False
+
+
 def main():
     config_path = os.path.expanduser("~/.bittrrt/config")
     default_config = {
@@ -852,16 +1201,34 @@ def main():
     }
     # copy to avoid mutating iter while parsing
     argv = list(sys.argv)
+
+    # Validate unknown dash-arguments: any argument that starts with a dash
+    # but is not a recognized CLI option should cause an error and exit.
+    known_args = set(cli_arg_map.keys()) | {"--sync-test", "--create-config", "--server"}
+    for arg in argv[1:]:
+        if isinstance(arg, str) and arg.startswith("-") and arg not in known_args:
+            print(f"Error: Unknown argument '{arg}'", file=sys.stderr)
+            sys.exit(1)
+
     for arg, key in cli_arg_map.items():
         if arg in argv:
             idx = argv.index(arg)
             if idx + 1 < len(argv):
                 config[key] = argv[idx + 1]
+
     # Flags without values
     if "--sync-test" in argv:
         config["--sync-test"] = True
+    # If --server is provided, run in server mode; otherwise run client mode
+    server_mode = "--server" in argv
 
-    # Initialize BittrRt with merged config (file + CLI overrides)
+    if not server_mode:
+        # Client mode: delegate to BittrRtClient
+        client = BittrRtClient(argv)
+        success = client.run()
+        sys.exit(0 if success else 1)
+
+    # Server mode: Initialize BittrRt with merged config (file + CLI overrides)
     bittrrt = BittrRt(config)
     # Start the server main loop (may add test connections via config)
     bittrrt.start_server()
