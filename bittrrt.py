@@ -1,5 +1,5 @@
-VERSION = "0.4"
-VERSION_NOTE = "Fixed port_type() in UpHandler/DnHandler, implemented SyncTest.close() with graceful subprocess shutdown, improved KeyboardInterrupt handling"
+VERSION = "0.5"
+VERSION_NOTE = "Implemented encrypted heartbeat system with DH key exchange, port handlers send UDP heartbeats, stale connection detection with automatic cleanup and port recycling, error handling for insufficient ports"
 
 DEBUG_MODE = True
 
@@ -28,9 +28,14 @@ SYNC_TEST_SLEEP      = 3          # seconds
 ESTABLISH_MAX_TIME   = 20_000     # milliseconds
 MAIN_RECV_TIMEOUT    = 250_000    # microseconds
 MAIN_MAX_PACKETS     = 100        # maximum number of packets to receive in main loop
-NEGOTIATION_DELAY    = 100        # milliseconds
+NEGOTIATION_DELAY    = 1000       # milliseconds
 NEGOTIATION_REPEAT   = 50         # number of attempts
 PORT_HANDLER_DELAY   = 1000       # milliseconds
+CLIENT_CONNECT_DELAY = 1000       # milliseconds
+KEEPALIVE_LOOP_DELAY = 5_000_000  # microseconds
+NOTIFY_DELAY         = 2000       # milliseconds - how often port handlers notify CommConnection
+STALE_CYCLES_MAX     = 5          # number of stale cycles before connection is considered dead
+STALE_CYCLES_MAX     = 10         # maximum number of stale cycles before considering a connection dead
 
 NET_OBS_KEY = 'OdiXEOXdvwgWfIizYjdEguhN-IP7eyqp9oITq_0MiBs='
 
@@ -582,10 +587,69 @@ class CommConnection(Connection):
         self.from_handler                                         = multiprocessing.Queue()
 
         self.sent_start_commands: bool                            = False
+        self.ctrl_port                                            = None
+        self.up_port                                              = None
+        self.dn_port                                              = None
+        self._established                                         = False
+        
+        # Track inpacket counts from handlers for stale detection
+        self.handler_inpacket_counts: Dict[str, int]              = {}
+        self.stale_cycles                                         = 0
+
+    def is_established(self):
+        return self._established
 
     def run_once(self):
         # minimal action for a comm connection
         print("CommConnection: run_once called")
+        if not self._established:
+            return True
+        
+        # Read all available notifications from handlers
+        any_count_increased = False
+        while True:
+            try:
+                msg = self.from_handler.get_nowait()
+                if isinstance(msg, dict) and "handler" in msg and "inpacket_count" in msg:
+                    handler_name = msg["handler"]
+                    new_count = msg["inpacket_count"]
+                    
+                    # Check if this is the first time we've seen this handler
+                    if handler_name not in self.handler_inpacket_counts:
+                        self.handler_inpacket_counts[handler_name] = new_count
+                        print(f"CommConnection: First count from {handler_name}: {new_count}")
+                    else:
+                        # Check if count has increased
+                        old_count = self.handler_inpacket_counts[handler_name]
+                        if new_count > old_count:
+                            any_count_increased = True
+                            print(f"CommConnection: {handler_name} count increased: {old_count} -> {new_count}")
+                        self.handler_inpacket_counts[handler_name] = new_count
+                else:
+                    print(f"CommConnection: received message from handler: {msg}")
+            except:
+                # No more messages in queue
+                break
+        
+        # Update stale cycles
+        if any_count_increased:
+            # Reset stale counter if any handler showed activity
+            if self.stale_cycles > 0:
+                print(f"CommConnection: Resetting stale cycles (was {self.stale_cycles})")
+            self.stale_cycles = 0
+        else:
+            # Only increment if we have received at least one notification from each handler
+            expected_handlers = {"CtrlHandler", "UpHandler", "DnHandler"}
+            if expected_handlers.issubset(set(self.handler_inpacket_counts.keys())):
+                self.stale_cycles += 1
+                print(f"CommConnection: Stale cycles: {self.stale_cycles}/{STALE_CYCLES_MAX}")
+                
+                if self.stale_cycles >= STALE_CYCLES_MAX:
+                    print(f"CommConnection: Connection is stale (exceeded {STALE_CYCLES_MAX} cycles)", file=sys.stderr)
+                    return False
+        
+        return True
+        
 
     def establish(self):
         # For testing, establish once and return True so it gets moved
@@ -616,13 +680,13 @@ class CommConnection(Connection):
 
             # Instantiate ctrl_handler if it doesn't exist
             if self.ctrl_handler is None:
-                ctrl_port = self.port_manager.get_next_port()
-                print(f"attempting to instantiate CTRL_HANDLER on port {ctrl_port}")
-                if ctrl_port is None:
+                self.ctrl_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate CTRL_HANDLER on port {self.ctrl_port}")
+                if self.ctrl_port is None:
                     print("CommConnection: Failed to get control port")
                     return False
                 self.ctrl_handler = CtrlHandler(
-                    ctrl_port,
+                    self.ctrl_port,
                     self.send_queues,
                     self.recv_queues,
                     self.from_handler,
@@ -637,13 +701,13 @@ class CommConnection(Connection):
             
             # Instantiate upld_handler if it doesn't exist
             if self.upld_handler is None:
-                up_port = self.port_manager.get_next_port()
-                print(f"attempting to instantiate UP_HANDLER on port {up_port}")
-                if up_port is None:
+                self.up_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate UP_HANDLER on port {self.up_port}")
+                if self.up_port is None:
                     print("CommConnection: Failed to get upload port")
                     return False
                 self.upld_handler = UpHandler(
-                    up_port,
+                    self.up_port,
                     self.send_queues,
                     self.recv_queues,
                     self.from_handler,
@@ -657,13 +721,13 @@ class CommConnection(Connection):
             
             # Instantiate dnld_handler if it doesn't exist
             if self.dnld_handler is None:
-                dn_port = self.port_manager.get_next_port()
-                print(f"attempting to instantiate DN_HANDLER on port {dn_port}")
-                if dn_port is None:
+                self.dn_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate DN_HANDLER on port {self.dn_port}")
+                if self.dn_port is None:
                     print("CommConnection: Failed to get download port")
                     return False
                 self.dnld_handler = DnHandler(
-                    dn_port,
+                    self.dn_port,
                     self.send_queues,
                     self.recv_queues,
                     self.from_handler,
@@ -683,7 +747,7 @@ class CommConnection(Connection):
                     self.recv_queues[PortType.DOWNLOAD].put(CommMsg.START)
                     self.sent_start_commands = True
                 else:
-                    print("CommConnection: establish successful")
+                    print("CommConnection: establish successful SETTING _established = True")
                     self._established = True
                     return True
                 
@@ -720,6 +784,23 @@ class CommConnection(Connection):
                     print(f"CommConnection: {name} handler already terminated")
         
         print("CommConnection: All handlers shut down")
+    
+    def release_ports(self):
+        """Return the three ports used by this connection back to the port manager."""
+        if self.ctrl_port is not None:
+            released = self.port_manager.release_port(self.ctrl_port)
+            print(f"CommConnection: Released ctrl_port {self.ctrl_port}: {released}")
+            self.ctrl_port = None
+        
+        if self.up_port is not None:
+            released = self.port_manager.release_port(self.up_port)
+            print(f"CommConnection: Released up_port {self.up_port}: {released}")
+            self.up_port = None
+        
+        if self.dn_port is not None:
+            released = self.port_manager.release_port(self.dn_port)
+            print(f"CommConnection: Released dn_port {self.dn_port}: {released}")
+            self.dn_port = None
 
 class Client:
     def __init__(self, config, addr, client_pubkey_b64, pm, ary_connections):
@@ -727,6 +808,7 @@ class Client:
         self.ce                = CommEncryptor()   
         self.server_pubkey_b64 = base64.urlsafe_b64encode(self.ce.get_public_key()).decode('ascii')
         self.config            = config
+        self.conn              = None
 
         # Decode the base64 public key and perform DH exchange on server side
         client_pubkey_bytes = base64.urlsafe_b64decode(client_pubkey_b64)
@@ -735,16 +817,31 @@ class Client:
         # Ensure we have enough available ports to create a communication instance
         
         if pm is None:
-            print("Error: PortManager not initialized; cannot start SyncTest.", file=sys.stderr)
+            print("Error: PortManager not initialized; cannot start Client.", file=sys.stderr)
             sys.exit(1)
         if pm.get_available_port_count() < 3:
-            print("Error: Not enough available ports for SyncTest (need >=3).", file=sys.stderr)
-            sys.exit(1)
+            print("Error: Not enough available ports for Client (need >=3).", file=sys.stderr)
+            raise RuntimeError("Not enough available ports for Client (need >=3).")
         self.conn = CommConnection(self.config, pm)
         ary_connections.append(self.conn)
 
-    def get_public_key_b64(self):
+    def get_server_public_key_b64(self):
         return self.server_pubkey_b64
+    
+    def is_established(self):
+        result = self.conn is not None and self.conn.is_established()
+        print(f"is_established returning {result}")
+        return result
+    
+    def get_port_numbers(self):
+        """Get the three port numbers used by the connection handlers."""
+        if self.conn is None:
+            return None, None, None
+        return self.conn.ctrl_port, self.conn.up_port, self.conn.dn_port
+    
+    def encrypt_data(self, data: bytes) -> bytes:
+        """Encrypt data using the established CommEncryptor."""
+        return self.ce.encrypt(data)
 
 class BittrRt:
     def __init__(self, config):
@@ -816,7 +913,7 @@ class BittrRt:
         try:
 
             elp  = LoopDelay(ESTABLISH_LOOP_DELAY)
-            edlp = LoopDelay(ESTABLISH_LOOP_DELAY)
+            edlp = LoopDelay(KEEPALIVE_LOOP_DELAY)
 
             while self.running:
                 # Try to receive UDP packets
@@ -868,7 +965,26 @@ class BittrRt:
                 if edlp.is_time_to_do_it():
                     for c in list(self.ary_established):
                         try:
-                            c.run_once()
+                            keep_alive = c.run_once()
+                            if keep_alive is False:
+                                print(f"\nConnection is stale, closing and cleaning up", file=sys.stderr)
+                                try:
+                                    c.close()
+                                except Exception as e:
+                                    print(f"Error closing stale connection: {e}", file=sys.stderr)
+                                
+                                # Release ports back to port manager if this is a CommConnection
+                                if isinstance(c, CommConnection):
+                                    try:
+                                        c.release_ports()
+                                    except Exception as e:
+                                        print(f"Error releasing ports: {e}", file=sys.stderr)
+                                
+                                # Remove from established connections
+                                try:
+                                    self.ary_established.remove(c)
+                                except ValueError:
+                                    pass
                         except Exception as e:
                             print(f"Connection run_once error: {e}", file=sys.stderr)
 
@@ -896,23 +1012,47 @@ class BittrRt:
 
     def _handle_connect(self, payload, addr):
         """Handle a 'connect' command from a client."""
+        client = None
         try:
             if self.clients.get(addr):  
+                client = self.clients[addr]
                 print(f"Client {addr} is already connected")
                 
             else:
                 client_pubkey_b64 = payload["pubkey"]
-                self.clients[addr] = Client(self.config, addr, client_pubkey_b64,self.port_manager, self.ary_connections)
-
-                
+                try:
+                    client = Client(self.config, addr, client_pubkey_b64,self.port_manager, self.ary_connections)
+                    self.clients[addr] = client
+                except RuntimeError as e:
+                    # Not enough ports available - send error message to client
+                    error_response = {"cmd": "error", "message": str(e)}
+                    error_json = json.dumps(error_response)
+                    error_token = self.dc.fencrypt(error_json)
+                    self.socket.sendto(error_token.encode('utf-8'), addr)
+                    print(f"Sent error response to client {addr}: {e}", file=sys.stderr)
+                    return
             
             # Send "connected" response
-            response = {"cmd": "connected", "pubkey": self.clients[addr].get_public_key_b64()}
+            response = {"cmd": "connected", "pubkey": client.get_server_public_key_b64()}
             response_json = json.dumps(response)
             response_token = self.dc.fencrypt(response_json)
             
             self.socket.sendto(response_token.encode('utf-8'), addr)
             print(f"\nNegotiated secure channel with client {addr}")
+            
+            # If the client connection is established, send port numbers
+            if client.is_established():
+                ctrl_port, up_port, dn_port = client.get_port_numbers()
+                if ctrl_port is not None and up_port is not None and dn_port is not None:
+                    port_data = json.dumps({
+                        "cmd": "ports",
+                        "ctrl_port": ctrl_port,
+                        "up_port": up_port,
+                        "dn_port": dn_port
+                    })
+                    encrypted_port_data = client.encrypt_data(port_data.encode('utf-8'))
+                    self.socket.sendto(encrypted_port_data, addr)
+                    print(f"Sent port numbers to client {addr}: ctrl={ctrl_port}, up={up_port}, dn={dn_port}")
         except Exception as e:
             print(f"Error handling connect from {addr}: {e}", file=sys.stderr)
             stack_trace = traceback.format_exc()
@@ -940,9 +1080,11 @@ class BittrRt:
 
 class PortHandler(ABC):
     def __init__(self, config):
-        self.config     = config
-        self.sync_sleep = 0
-        self.inpacket   = None
+        self.config             = config
+        self.sync_sleep         = 0
+        self.inpacket           = None
+        self.inpacket_count     = 0
+        self.last_notify_time   = None  # Track when we last sent notification
 
         if "--sync-test" in self.config:
             self.sync_sleep = SYNC_TEST_SLEEP
@@ -966,7 +1108,7 @@ class PortHandler(ABC):
     def run(self):
         """Main loop for the handler."""
         try:
-            self.usock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.usock.bind((self.config.get("bind_address", "0.0.0.0"), self.port))
         except OSError as e:
             if e.errno == errno.EADDRINUSE:
@@ -984,20 +1126,19 @@ class PortHandler(ABC):
         print(f"{self.__class__.__name__} received initial message from comm queue: {msg_from_comm}")
         if msg_from_comm==CommMsg.START:
             try:
-                self.usock.listen()
+                # Set socket timeout for non-blocking receives
                 if PORT_HANDLER_DELAY > 0:
-                    # Use socket.settimeout; socket.timeout is an exception class and
-                    # socket objects expose settimeout() to configure recv timeouts.
                     self.usock.settimeout(PORT_HANDLER_DELAY / 1000.0)
                     print(f"{self.__class__.__name__} socket timeout set to {PORT_HANDLER_DELAY} ms")
             except Exception as e:
-                print(f"Error listening on socket in {self.__class__.__name__}: {e}", file=sys.stderr)
+                print(f"Error setting socket timeout in {self.__class__.__name__}: {e}", file=sys.stderr)
                 stack_trace = traceback.format_exc()
                 print(stack_trace, file=sys.stderr)
                 sys.stderr.flush()  
                 return
             
             running = True
+            self.last_notify_time = time.perf_counter_ns() // 1_000_000  # milliseconds
             try:
                 while running:
                     try:
@@ -1012,11 +1153,28 @@ class PortHandler(ABC):
                         print(f"Error in {self.__class__.__name__} run loop: {e}", file=sys.stderr)
 
                     try:
-                        self.inpacket = self.usock.recv(1500)
+                        data, addr = self.usock.recvfrom(1500)
+                        # Print received heartbeat to stderr
+                        print(f"{self.__class__.__name__} received heartbeat from {addr}: {data.decode('utf-8', errors='ignore')}", file=sys.stderr)
+                        self.inpacket = data
+                        self.inpacket_count += 1
                     except socket.timeout:
                         pass
                     except Exception as e:
                         print(f"Error receiving data in {self.__class__.__name__}: {e}", file=sys.stderr)
+
+                    # Check if it's time to send notification to CommConnection
+                    current_time = time.perf_counter_ns() // 1_000_000  # milliseconds
+                    if current_time - self.last_notify_time >= NOTIFY_DELAY:
+                        self.last_notify_time = current_time
+                        notification = {
+                            "handler": self.__class__.__name__,
+                            "inpacket_count": self.inpacket_count
+                        }
+                        try:
+                            self.to_comm.put_nowait(notification)
+                        except Exception as e:
+                            print(f"Error sending notification from {self.__class__.__name__}: {e}", file=sys.stderr)
 
                     self.iter()
             except KeyboardInterrupt:
@@ -1288,40 +1446,82 @@ class BittrRtClient:
 
         try:
             dc = DoCrypt(self.net_obs_key)
-            token = dc.fencrypt(payload_json)
+            
         except Exception as e:
             print(f"Error: failed to encrypt payload: {e}", file=sys.stderr)
             return False
+        
+        send_timestamp = None
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(NEGOTIATION_DELAY / 1000.0)  # Convert ms to seconds
             
             # Send connect repeatedly and wait for response
+            got_pubkey = False
             for attempt in range(NEGOTIATION_REPEAT):
-                sock.sendto(token.encode('utf-8'), (address, port))
+                token = dc.fencrypt(payload_json)
+                if send_timestamp is None or (time.time() - send_timestamp) * 1000 >= CLIENT_CONNECT_DELAY:
+                    sock.sendto(token.encode('utf-8'), (address, port))
+                    send_timestamp = time.time()
                 
                 # Try to receive a response
                 try:
+                    print("Waiting for response from server...", file=sys.stderr)
                     response_data, server_addr = sock.recvfrom(4096)
+
+                    if got_pubkey:
+                        # We've already got the pubkey, so this should be the port numbers
+                        # Try to decrypt using CommEncryptor (binary data, not UTF-8 encoded)
+                        try:
+                            decrypted_port_data = ce.decrypt(response_data)
+                            port_info = json.loads(decrypted_port_data.decode('utf-8'))
+                            
+                            if port_info.get("cmd") == "ports":
+                                ctrl_port = port_info.get("ctrl_port")
+                                up_port = port_info.get("up_port")
+                                dn_port = port_info.get("dn_port")
+                                
+                                print(f"Received port numbers: ctrl={ctrl_port}, up={up_port}, dn={dn_port}", file=sys.stderr)
+                                
+                                # Start heartbeat to the three ports
+                                self._start_heartbeat(address, ctrl_port, up_port, dn_port)
+                                sock.close()
+                                return True
+                        except Exception as e:
+                            print(f"Error decrypting port data: {e}", file=sys.stderr)
+                            # Continue to try again
+                            continue
                     
-                    # Decrypt the response
-                    response_token = response_data.decode('utf-8')
-                    response_json = dc.fdecrypt(response_token)
-                    response = json.loads(response_json)
-                    
-                    # Check if it's a "connected" response
-                    if response.get("cmd") == "connected" and "pubkey" in response:
-                        server_pubkey_b64 = response["pubkey"]
-                        server_pubkey_bytes = base64.urlsafe_b64decode(server_pubkey_b64)
+                    # Try to decrypt as a DoCrypt message (the "connected" response)
+                    try:
+                        print("Decrypting response from server...", file=sys.stderr)
+                        response_token = response_data.decode('utf-8')
+                        response_json = dc.fdecrypt(response_token)
+                        response = json.loads(response_json)
                         
-                        # Perform DH exchange
-                        ce.derive_shared_secret(server_pubkey_bytes)
+                        # Check if it's an error response
+                        if response.get("cmd") == "error":
+                            error_msg = response.get("message", "Unknown error")
+                            print(f"\nError from server: {error_msg}", file=sys.stderr)
+                            sock.close()
+                            return False
                         
-                        print(f"Successfully connected to {address}:{port}")
-                        print(f"Established secure channel with server")
-                        sock.close()
-                        return True
+                        # Check if it's a "connected" response
+                        if response.get("cmd") == "connected" and "pubkey" in response:
+                            if not got_pubkey:
+                                server_pubkey_b64 = response["pubkey"]
+                                server_pubkey_bytes = base64.urlsafe_b64decode(server_pubkey_b64)
+                            
+                                # Perform DH exchange
+                                ce.derive_shared_secret(server_pubkey_bytes)
+                                
+                                print(f"Successfully connected to {address}:{port}", file=sys.stderr)
+                                print(f"Established secure channel with server", file=sys.stderr)
+                                got_pubkey = True
+                    except Exception as e:
+                        # If decryption fails, might be port data, will try on next iteration
+                        pass
                     
                 except socket.timeout:
                     # No response yet, continue trying
@@ -1337,6 +1537,52 @@ class BittrRtClient:
         except Exception as e:
             print(f"Error sending UDP packet to {address}:{port}: {e}", file=sys.stderr)
             return False
+    
+    def _start_heartbeat(self, address, ctrl_port, up_port, dn_port):
+        """Start sending heartbeat messages to the three ports."""
+        # Read heartbeat_rate from config or use default
+        config_path = os.path.expanduser("~/.bittrrt/config")
+        heartbeat_rate = 5000  # Default: 5 seconds in milliseconds
+        
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        if key.strip() == "heartbeat_rate":
+                            try:
+                                heartbeat_rate = int(value.strip())
+                            except ValueError:
+                                pass
+        
+        # Create three UDP sockets
+        try:
+            ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            up_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            dn_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            
+            print(f"Starting heartbeat every {heartbeat_rate}ms")
+            
+            # Send heartbeats in a loop
+            heartbeat_count = 0
+            while True:
+                heartbeat_msg = f"heartbeat-{heartbeat_count}".encode('utf-8')
+                
+                ctrl_sock.sendto(heartbeat_msg, (address, ctrl_port))
+                up_sock.sendto(heartbeat_msg, (address, up_port))
+                dn_sock.sendto(heartbeat_msg, (address, dn_port))
+                
+                heartbeat_count += 1
+                time.sleep(heartbeat_rate / 1000.0)  # Convert ms to seconds
+                
+        except KeyboardInterrupt:
+            print("\nHeartbeat stopped by user")
+            ctrl_sock.close()
+            up_sock.close()
+            dn_sock.close()
+        except Exception as e:
+            print(f"Error in heartbeat: {e}", file=sys.stderr)
 
 
 def main():
