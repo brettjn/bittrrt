@@ -1,5 +1,5 @@
-VERSION = "0.5"
-VERSION_NOTE = "Implemented encrypted heartbeat system with DH key exchange, port handlers send UDP heartbeats, stale connection detection with automatic cleanup and port recycling, error handling for insufficient ports"
+VERSION = "0.6"
+VERSION_NOTE = "Encrypted header fields (channel/sequence/offset) with payload in CommEncryptor; decrypt() now returns header + plaintext. Also heartbeat, stale detection, and port-recycle improvements."
 
 DEBUG_MODE = True
 
@@ -159,7 +159,7 @@ class CommEncryptor:
         # Initialize ChaCha20Poly1305 cipher with derived key
         self.cipher = ChaCha20Poly1305(derived_key)
     
-    def encrypt(self, plaintext: bytes, associated_data: bytes = b'') -> bytes:
+    def encrypt(self, plaintext: bytes, associated_data: bytes = b'', channel: int = 0, sequence: int = 0, offset: int = 0) -> bytes:
         """Encrypt plaintext using ChaCha20Poly1305.
         
         Args:
@@ -174,14 +174,20 @@ class CommEncryptor:
         
         # Generate a random 12-byte nonce
         nonce = os.urandom(12)
-        
-        # Encrypt and authenticate
-        ciphertext = self.cipher.encrypt(nonce, plaintext, associated_data)
-        
-        # Return nonce + ciphertext (ciphertext includes the auth tag)
+
+        # Pack channel (4 bytes unsigned), sequence (8 bytes unsigned), offset (8 bytes unsigned)
+        header = struct.pack('>IQQ', int(channel) & 0xFFFFFFFF, int(sequence) & 0xFFFFFFFFFFFFFFFF, int(offset) & 0xFFFFFFFFFFFFFFFF)
+
+        # Prepend header to plaintext so header is encrypted/authenticated with the payload
+        to_encrypt = header + plaintext
+
+        # Encrypt and authenticate (ciphertext includes the auth tag)
+        ciphertext = self.cipher.encrypt(nonce, to_encrypt, associated_data)
+
+        # Return nonce + ciphertext
         return nonce + ciphertext
     
-    def decrypt(self, encrypted_data: bytes, associated_data: bytes = b'') -> bytes:
+    def decrypt(self, encrypted_data: bytes, associated_data: bytes = b''):
         """Decrypt data encrypted with ChaCha20Poly1305.
         
         Args:
@@ -197,19 +203,35 @@ class CommEncryptor:
         if self.cipher is None:
             raise RuntimeError("Must call derive_shared_secret() before decrypting")
         
-        if len(encrypted_data) < 12:
-            raise ValueError("Encrypted data too short (missing nonce)")
-        
+        # Expect at least: nonce (12) + auth tag (16)
+        min_len = 12 + 16
+        if len(encrypted_data) < min_len:
+            raise ValueError("Encrypted data too short (missing nonce/ciphertext)")
+
         # Extract nonce and ciphertext
         nonce = encrypted_data[:12]
         ciphertext = encrypted_data[12:]
-        
+
         # Decrypt and verify authentication
         try:
-            plaintext = self.cipher.decrypt(nonce, ciphertext, associated_data)
-            return plaintext
+            decrypted = self.cipher.decrypt(nonce, ciphertext, associated_data)
         except Exception as e:
             raise ValueError(f"Decryption failed: {e}")
+
+        # Decrypted payload must contain header (4+8+8 = 20 bytes) followed by plaintext
+        if len(decrypted) < 20:
+            raise ValueError("Decrypted payload too short (missing header)")
+
+        header = decrypted[:20]
+        plaintext = decrypted[20:]
+
+        try:
+            channel, sequence, offset = struct.unpack('>IQQ', header)
+        except Exception as e:
+            raise ValueError(f"Failed to parse header fields: {e}")
+
+        # Return header fields and plaintext bytes
+        return channel, sequence, offset, plaintext
 
 class PortType(Enum):
     """Port types for client connections"""
@@ -1474,16 +1496,16 @@ class BittrRtClient:
                         # We've already got the pubkey, so this should be the port numbers
                         # Try to decrypt using CommEncryptor (binary data, not UTF-8 encoded)
                         try:
-                            decrypted_port_data = ce.decrypt(response_data)
+                            channel, sequence, offset, decrypted_port_data = ce.decrypt(response_data)
                             port_info = json.loads(decrypted_port_data.decode('utf-8'))
-                            
+
                             if port_info.get("cmd") == "ports":
                                 ctrl_port = port_info.get("ctrl_port")
                                 up_port = port_info.get("up_port")
                                 dn_port = port_info.get("dn_port")
-                                
-                                print(f"Received port numbers: ctrl={ctrl_port}, up={up_port}, dn={dn_port}", file=sys.stderr)
-                                
+
+                                print(f"Received port numbers: ctrl={ctrl_port}, up={up_port}, dn={dn_port} (hdr: ch={channel}, seq={sequence}, off={offset})", file=sys.stderr)
+
                                 # Start heartbeat to the three ports
                                 self._start_heartbeat(address, ctrl_port, up_port, dn_port)
                                 sock.close()
