@@ -1,6 +1,8 @@
 VERSION = "0.4"
 VERSION_NOTE = "Fixed port_type() in UpHandler/DnHandler, implemented SyncTest.close() with graceful subprocess shutdown, improved KeyboardInterrupt handling"
 
+DEBUG_MODE = True
+
 import os
 import socket
 import sys
@@ -19,6 +21,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 import json
 import base64
+import traceback
 
 ESTABLISH_LOOP_DELAY = 1_000_000  # microseconds
 SYNC_TEST_SLEEP      = 3          # seconds
@@ -27,6 +30,7 @@ MAIN_RECV_TIMEOUT    = 250_000    # microseconds
 MAIN_MAX_PACKETS     = 100        # maximum number of packets to receive in main loop
 NEGOTIATION_DELAY    = 100        # milliseconds
 NEGOTIATION_REPEAT   = 50         # number of attempts
+PORT_HANDLER_DELAY   = 1000       # milliseconds
 
 NET_OBS_KEY = 'OdiXEOXdvwgWfIizYjdEguhN-IP7eyqp9oITq_0MiBs='
 
@@ -44,7 +48,9 @@ class DoCrypt:
             key = key.encode('utf-8')
         if not isinstance(key, (bytes, bytearray)):
             raise TypeError('Fernet key must be bytes or str')
-        self._fernet = Fernet(key)
+        
+        self._fernet  = Fernet(key)
+        self.inc_salt = 0
 
     def fencrypt(self, text: str) -> str:
         """Encrypt `text` and return a token string.
@@ -57,7 +63,16 @@ class DoCrypt:
         """
         if not isinstance(text, str):
             raise TypeError('text must be a str')
-        token = self._fernet.encrypt(text.encode('utf-8'))
+
+        # Prepend an 8-byte (64-bit) incrementing salt to the plaintext
+        plaintext_bytes = text.encode('utf-8')
+        salt_bytes = struct.pack('>Q', self.inc_salt & 0xFFFFFFFFFFFFFFFF)
+        to_encrypt = salt_bytes + plaintext_bytes
+
+        # Increment salt modulo 2**64 for next encryption
+        self.inc_salt = (self.inc_salt + 1) & 0xFFFFFFFFFFFFFFFF
+
+        token = self._fernet.encrypt(to_encrypt)
         return token.decode('utf-8')
 
     def fdecrypt(self, token: str) -> str:
@@ -71,7 +86,14 @@ class DoCrypt:
             data = self._fernet.decrypt(token.encode('utf-8'))
         except InvalidToken as e:
             raise ValueError('Invalid token or decryption failed') from e
-        return data.decode('utf-8')
+
+        # Expect at least eight bytes (the 64-bit salt) followed by the original plaintext
+        if len(data) < 8:
+            raise ValueError('Decrypted data too short (missing 8-byte salt)')
+
+        # Strip the leading 8-byte salt and return the plaintext
+        plaintext_bytes = data[8:]
+        return plaintext_bytes.decode('utf-8')
 
 
 class CommEncryptor:
@@ -542,6 +564,188 @@ class SyncTest(Connection):
         
         print("SyncTest: All handlers shut down")
 
+class CommConnection(Connection):
+    """A communication connection initially identical to SyncTest.
+
+    This class is a placeholder duplicate of `SyncTest` and can be
+    specialized later for communication-specific behavior.
+    """
+    def __init__(self, config, port_manager):
+        super().__init__(config, port_manager)
+        self.send_queues:  Dict[PortType, multiprocessing.Queue]  = None
+        self.recv_queues:  Dict[PortType, multiprocessing.Queue]  = None
+
+        self.ctrl_handler: Optional[CtrlHandler]                  = None
+        self.upld_handler:   Optional[UpHandler]                  = None
+        self.dnld_handler:   Optional[DnHandler]                  = None
+
+        self.from_handler                                         = multiprocessing.Queue()
+
+        self.sent_start_commands: bool                            = False
+
+    def run_once(self):
+        # minimal action for a comm connection
+        print("CommConnection: run_once called")
+
+    def establish(self):
+        # For testing, establish once and return True so it gets moved
+        
+        msg=None
+        try:
+            msg=self.from_handler.get_nowait()
+        except:
+            pass
+
+        if msg:
+            print("CommConnection: received message from handler:", msg)
+
+        if not self._established:
+            
+            if self.send_queues is None:
+                self.send_queues = {}
+                self.send_queues[PortType.CONTROL]  = multiprocessing.Queue()
+                self.send_queues[PortType.UPLOAD]   = multiprocessing.Queue()
+                self.send_queues[PortType.DOWNLOAD] = multiprocessing.Queue()
+
+            if self.recv_queues is None:
+                self.recv_queues = {}
+                self.recv_queues[PortType.CONTROL]  = multiprocessing.Queue()
+                self.recv_queues[PortType.UPLOAD]   = multiprocessing.Queue()
+                self.recv_queues[PortType.DOWNLOAD] = multiprocessing.Queue()
+
+
+            # Instantiate ctrl_handler if it doesn't exist
+            if self.ctrl_handler is None:
+                ctrl_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate CTRL_HANDLER on port {ctrl_port}")
+                if ctrl_port is None:
+                    print("CommConnection: Failed to get control port")
+                    return False
+                self.ctrl_handler = CtrlHandler(
+                    ctrl_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config
+                )
+                return
+            
+            if not self.ctrl_handler.process.is_alive():
+                print("CommConnection: Control handler process is not alive - removing")
+                self.ctrl_handler = None
+                return False
+            
+            # Instantiate upld_handler if it doesn't exist
+            if self.upld_handler is None:
+                up_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate UP_HANDLER on port {up_port}")
+                if up_port is None:
+                    print("CommConnection: Failed to get upload port")
+                    return False
+                self.upld_handler = UpHandler(
+                    up_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config
+                )
+                return
+            
+            if not self.upld_handler.process.is_alive():
+                print("CommConnection: Upload handler process is not alive")
+                return False
+            
+            # Instantiate dnld_handler if it doesn't exist
+            if self.dnld_handler is None:
+                dn_port = self.port_manager.get_next_port()
+                print(f"attempting to instantiate DN_HANDLER on port {dn_port}")
+                if dn_port is None:
+                    print("CommConnection: Failed to get download port")
+                    return False
+                self.dnld_handler = DnHandler(
+                    dn_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config
+                )
+                return
+            
+            if not self.dnld_handler.process.is_alive():    
+                print("CommConnection: Download handler process is not alive")
+                return False
+
+            if self.ctrl_handler.process.is_alive() and self.upld_handler.process.is_alive() and self.dnld_handler.process.is_alive():
+                print("CommConnection: All handlers alive")
+                if not self.sent_start_commands:
+                    self.recv_queues[PortType.CONTROL].put(CommMsg.START)
+                    self.recv_queues[PortType.UPLOAD].put(CommMsg.START)
+                    self.recv_queues[PortType.DOWNLOAD].put(CommMsg.START)
+                    self.sent_start_commands = True
+                else:
+                    print("CommConnection: establish successful")
+                    self._established = True
+                    return True
+                
+        return False
+
+    def close(self):
+        """Shutdown all handler subprocesses by sending STOP messages and waiting for them to terminate."""
+        handlers = [
+            (self.ctrl_handler, PortType.CONTROL, "Control"),
+            (self.upld_handler, PortType.UPLOAD, "Upload"),
+            (self.dnld_handler, PortType.DOWNLOAD, "Download")
+        ]
+        
+        # Send STOP messages to all alive handlers
+        for handler, port_type, name in handlers:
+            if handler is not None and handler.process.is_alive():
+                print(f"CommConnection: Sending STOP to {name} handler")
+                self.recv_queues[port_type].put(CommMsg.STOP)
+        
+        # Wait for all processes to terminate
+        for handler, port_type, name in handlers:
+            if handler is not None:
+                if handler.process.is_alive():
+                    print(f"CommConnection: Waiting for {name} handler to terminate...")
+                    handler.process.join(timeout=5.0)
+                    if handler.process.is_alive():
+                        print(f"CommConnection: {name} handler did not terminate, forcing termination")
+                        handler.process.terminate()
+                        handler.process.join(timeout=1.0)
+                        if handler.process.is_alive():
+                            print(f"CommConnection: {name} handler still alive, killing")
+                            handler.process.kill()
+                else:
+                    print(f"CommConnection: {name} handler already terminated")
+        
+        print("CommConnection: All handlers shut down")
+
+class Client:
+    def __init__(self, config, addr, client_pubkey_b64, pm, ary_connections):
+        self.addr              = addr
+        self.ce                = CommEncryptor()   
+        self.server_pubkey_b64 = base64.urlsafe_b64encode(self.ce.get_public_key()).decode('ascii')
+        self.config            = config
+
+        # Decode the base64 public key and perform DH exchange on server side
+        client_pubkey_bytes = base64.urlsafe_b64decode(client_pubkey_b64)
+        self.ce.derive_shared_secret(client_pubkey_bytes)    
+
+        # Ensure we have enough available ports to create a communication instance
+        
+        if pm is None:
+            print("Error: PortManager not initialized; cannot start SyncTest.", file=sys.stderr)
+            sys.exit(1)
+        if pm.get_available_port_count() < 3:
+            print("Error: Not enough available ports for SyncTest (need >=3).", file=sys.stderr)
+            sys.exit(1)
+        self.conn = CommConnection(self.config, pm)
+        ary_connections.append(self.conn)
+
+    def get_public_key_b64(self):
+        return self.server_pubkey_b64
+
 class BittrRt:
     def __init__(self, config):
         self.config = config
@@ -557,8 +761,13 @@ class BittrRt:
         self.ary_connections = []
         # array of established Connection instances
         self.ary_established = []
+
+        self.dc              = DoCrypt(NET_OBS_KEY)
+        self.clients         = {}
+
         # running flag for the main loop
         self.running = False
+
 
     def start_server(self):
         """Prepare connections (optionally add SyncTest) and start the run loop."""
@@ -665,8 +874,10 @@ class BittrRt:
 
 
                 # indicate liveliness and sleep
-                print('b', end='', flush=True)
+                if DEBUG_MODE:
+                    print('b', end='', flush=True)
                 #time.sleep(0.25)
+
         except KeyboardInterrupt:
             print("\nReceived SIGINT, shutting down...", file=sys.stderr)
             self.running = False
@@ -683,46 +894,55 @@ class BittrRt:
                     print(f"Error closing connection: {e}", file=sys.stderr)
             sys.exit(0)
 
+    def _handle_connect(self, payload, addr):
+        """Handle a 'connect' command from a client."""
+        try:
+            if self.clients.get(addr):  
+                print(f"Client {addr} is already connected")
+                
+            else:
+                client_pubkey_b64 = payload["pubkey"]
+                self.clients[addr] = Client(self.config, addr, client_pubkey_b64,self.port_manager, self.ary_connections)
+
+                
+            
+            # Send "connected" response
+            response = {"cmd": "connected", "pubkey": self.clients[addr].get_public_key_b64()}
+            response_json = json.dumps(response)
+            response_token = self.dc.fencrypt(response_json)
+            
+            self.socket.sendto(response_token.encode('utf-8'), addr)
+            print(f"\nNegotiated secure channel with client {addr}")
+        except Exception as e:
+            print(f"Error handling connect from {addr}: {e}", file=sys.stderr)
+            stack_trace = traceback.format_exc()
+            print(stack_trace, file=sys.stderr) 
+            sys.stderr.flush()
+
     def _handle_packets(self, ary_packets):
         """Handle incoming UDP packets, including connection negotiation."""
-        dc = DoCrypt(NET_OBS_KEY)
         
         for data, addr in ary_packets:
             try:
                 # Decrypt the packet
                 token = data.decode('utf-8')
-                payload_json = dc.fdecrypt(token)
+                payload_json = self.dc.fdecrypt(token)
                 payload = json.loads(payload_json)
                 
                 # Handle "connect" command
                 if payload.get("cmd") == "connect" and "pubkey" in payload:
-                    client_pubkey_b64 = payload["pubkey"]
-                    client_pubkey_bytes = base64.urlsafe_b64decode(client_pubkey_b64)
-                    
-                    # Generate server's key pair
-                    ce = CommEncryptor()
-                    server_pubkey_bytes = ce.get_public_key()
-                    server_pubkey_b64 = base64.urlsafe_b64encode(server_pubkey_bytes).decode('ascii')
-                    
-                    # Perform DH exchange on server side
-                    ce.derive_shared_secret(client_pubkey_bytes)
-                    
-                    # Send "connected" response
-                    response = {"cmd": "connected", "pubkey": server_pubkey_b64}
-                    response_json = json.dumps(response)
-                    response_token = dc.fencrypt(response_json)
-                    
-                    self.socket.sendto(response_token.encode('utf-8'), addr)
-                    print(f"\nNegotiated secure channel with client {addr}")
+                    self._handle_connect(payload, addr)
                     
             except Exception as e:
                 print(f"Error handling packet from {addr}: {e}", file=sys.stderr)
+                    
 
 
 class PortHandler(ABC):
     def __init__(self, config):
         self.config     = config
         self.sync_sleep = 0
+        self.inpacket   = None
 
         if "--sync-test" in self.config:
             self.sync_sleep = SYNC_TEST_SLEEP
@@ -765,8 +985,16 @@ class PortHandler(ABC):
         if msg_from_comm==CommMsg.START:
             try:
                 self.usock.listen()
+                if PORT_HANDLER_DELAY > 0:
+                    # Use socket.settimeout; socket.timeout is an exception class and
+                    # socket objects expose settimeout() to configure recv timeouts.
+                    self.usock.settimeout(PORT_HANDLER_DELAY / 1000.0)
+                    print(f"{self.__class__.__name__} socket timeout set to {PORT_HANDLER_DELAY} ms")
             except Exception as e:
                 print(f"Error listening on socket in {self.__class__.__name__}: {e}", file=sys.stderr)
+                stack_trace = traceback.format_exc()
+                print(stack_trace, file=sys.stderr)
+                sys.stderr.flush()  
                 return
             
             running = True
@@ -782,6 +1010,13 @@ class PortHandler(ABC):
                                 break
                     except Exception as e:
                         print(f"Error in {self.__class__.__name__} run loop: {e}", file=sys.stderr)
+
+                    try:
+                        self.inpacket = self.usock.recv(1500)
+                    except socket.timeout:
+                        pass
+                    except Exception as e:
+                        print(f"Error receiving data in {self.__class__.__name__}: {e}", file=sys.stderr)
 
                     self.iter()
             except KeyboardInterrupt:
@@ -811,6 +1046,9 @@ class CtrlHandler(PortHandler):
         return(PortType.CONTROL)
 
     def iter(self):
+        if self.inpacket is not None:
+            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            self.inpacket = None
         print('(CH)', end='', flush=True)
         time.sleep(self.sync_sleep)    
 
@@ -843,6 +1081,9 @@ class UpHandler(PortHandler):
         return(PortType.UPLOAD)
 
     def iter(self):
+        if self.inpacket is not None:
+            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            self.inpacket = None
         print('(UH)', end='', flush=True)
         time.sleep(self.sync_sleep)    
 
@@ -875,6 +1116,9 @@ class DnHandler(PortHandler):
         return(PortType.DOWNLOAD)
 
     def iter(self):
+        if self.inpacket is not None:
+            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            self.inpacket = None
         print('(DH)', end='', flush=True)
         time.sleep(self.sync_sleep)    
 

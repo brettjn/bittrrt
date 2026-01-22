@@ -10,9 +10,9 @@ python -m unittest tests.test_config -v
 python3 -m unittest discover -v
 
 # Test DH implementation
-python3 test_dh_exchange.py
+python3 tests/test_dh_exchange.py
 
-# View the demo
-python3 demo_key_exchange.py
+# Test key exchange
+python3 tests/demo_key_exchange.py
 
 

@@ -5,6 +5,14 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Get the path of the current script's directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# Get the parent directory's path
+parent_dir = os.path.dirname(current_dir)
+
+# Add the parent directory to sys.path (insert at index 0 to prioritize)
+sys.path.insert(0, parent_dir)
+
 from bittrrt import CommEncryptor
 
 def test_key_generation():
