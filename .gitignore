@@ -220,3 +220,6 @@ prompts.txt
 
 #work log
 work_log.txt
+
+#vscode settings    
+.vscode/    
