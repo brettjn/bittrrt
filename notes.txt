@@ -2,3 +2,17 @@
 
 # To RUN tests
 python -m unittest tests.test_config -v
+
+
+# More TESTS
+
+# Run existing tests
+python3 -m unittest discover -v
+
+# Test DH implementation
+python3 test_dh_exchange.py
+
+# View the demo
+python3 demo_key_exchange.py
+
+
