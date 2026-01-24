@@ -1,5 +1,5 @@
-VERSION = "0.7"
-VERSION_NOTE = "Client now calculates and displays server latency from heartbeat messages with sequence=0 using server timestamps at positions 2 and 4."
+VERSION = "0.8"
+VERSION_NOTE = "Added --bwup client option and bwup/ACK message flow; client now calculates server latency from heartbeat sequence=0."
 
 DEBUG_MODE = True
 
@@ -58,6 +58,7 @@ class MsgFlags(Enum):
     UNLOSSY      = 3
     BINARY       = 4
     DATA         = 5
+    ACK          = 6
 
 
 class DoCrypt:
@@ -887,12 +888,30 @@ class ClientCommConnection(ClientConnection):
         # Track inpacket counts from handlers for stale detection
         self.handler_inpacket_counts: Dict[str, int]              = {}
         self.stale_cycles                                         = 0
+        
+        # Track if bwup message has been sent
+        self.bwup_duration: Optional[int]                         = None
 
-    def run_once(self):
+        self._established                                         = False
+
+    def run_once(self, options=None):
         # minimal action for a comm connection
         print("ClientCommConnection: run_once called")
         if not self._established:
             return True
+        
+        # Check if bwup option is passed and send message to control handler
+        if options and "bwup" in options and self.bwup_duration is None:
+            bwup_value = options["bwup"]
+            self.bwup_duration = bwup_value
+            # Send bwup message to control handler via its recv_queue
+            if self.ctrl_handler and self.recv_queues:
+                try:
+                    msg = {"cmd": "bwup", "duration": bwup_value}
+                    self.recv_queues[PortType.CONTROL].put_nowait(msg)
+                    print(f"ClientCommConnection: sent bwup={bwup_value} to control handler")
+                except Exception as e:
+                    print(f"ClientCommConnection: error sending bwup message: {e}", file=sys.stderr)
         
         # Read all available notifications from handlers
         any_count_increased = False
@@ -1531,6 +1550,29 @@ class PortHandler(ABC):
                             try:
                                 flags, channel, sequence, offset, plaintext = self.comm_encryptor.decrypt(data)
                                 
+                                # Check if flags=0 (message requiring ACK)
+                                if flags == 0:
+                                    print(f"{self.__class__.__name__} received message with flags=0, sequence={sequence} from {addr[0]}:{addr[1]}", file=sys.stderr)
+                                    try:
+                                        msg_content = json.loads(plaintext.decode('utf-8'))
+                                        print(f"{self.__class__.__name__} message content: {msg_content}", file=sys.stderr)
+                                    except:
+                                        pass
+                                    
+                                    # Send ACK response
+                                    ack_flags = (1 << MsgFlags.ACK.value)
+                                    ack_payload = b'ACK'
+                                    encrypted_ack = self.comm_encryptor.encrypt(
+                                        ack_payload,
+                                        flags=ack_flags,
+                                        channel=channel,
+                                        sequence=sequence,
+                                        offset=0
+                                    )
+                                    self.usock.sendto(encrypted_ack, addr)
+                                    print(f"{self.__class__.__name__} sent ACK with sequence={sequence} to {addr[0]}:{addr[1]}", file=sys.stderr)
+                                    handled = True
+                                
                                 # Check if HEARTBEAT flag is set
                                 if flags & (1 << MsgFlags.HEARTBEAT.value):
                                     #print(f"{self.__class__.__name__} received HEARTBEAT from {addr[0]}:{addr[1]} sequence={sequence}", file=sys.stderr)
@@ -1818,6 +1860,14 @@ class ClientPortHandler(ABC):
                             try:
                                 flags, channel, sequence, offset, plaintext = self.comm_encryptor.decrypt(data)
                                 
+                                # Check if ACK flag is set
+                                if flags & (1 << MsgFlags.ACK.value):
+                                    # Use sequence number as key to remove from to_server_msgs
+                                    if hasattr(self, 'to_server_msgs') and sequence in self.to_server_msgs:
+                                        removed_msg = self.to_server_msgs.pop(sequence)
+                                        print(f"{self.__class__.__name__} received ACK for key={sequence}, removed message: {removed_msg}")
+                                        handled = True
+                                
                                 # Check if HEARTBEAT flag is set
                                 if flags & (1 << MsgFlags.HEARTBEAT.value):
                                     #print(f"{self.__class__.__name__} received HEARTBEAT from {addr}", file=sys.stderr)
@@ -1884,8 +1934,8 @@ class ClientPortHandler(ABC):
                             except Exception as e:
                                 print(f"{self.__class__.__name__} error sending heartbeat: {e}", file=sys.stderr)
 
-                    if not handled and sequence is not None:
-                        self.iter()
+                    
+                    self.iter(handled,flags, channel, sequence, offset, plaintext)
             except KeyboardInterrupt:
                 # Gracefully handle CTRL-C in subprocess
                 pass
@@ -1923,21 +1973,58 @@ class ClientCtrlHandler(ClientPortHandler):
         self.recv_queue = recv_queue
         self.to_comm    = to_comm
         self.server_addr = server_addr
+        self.to_server_msgs = {}  # Dictionary to store messages awaiting ACK
 
         self.run_in_own_process()
 
     def port_type(self):
         return(PortType.CONTROL)
 
-    def iter(self):
-        if self.inpacket is not None:
-            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
-            self.inpacket = None
+    def iter(self,handled,flags, channel, sequence, offset, plaintext):
+        if sequence is not None and not handled:
+            print(f"{self.__class__.__name__} channel:{channel} sequence:{sequence} offset:{offset} plaintext:{plaintext}")
+        
+        # Send any pending to_server_msgs
+        if self.to_server_msgs and self.comm_encryptor is not None:
+            for msg_key, msg_content in list(self.to_server_msgs.items()):
+                try:
+                    # Serialize message content to JSON bytes
+                    msg_json = json.dumps(msg_content)
+                    msg_bytes = msg_json.encode('utf-8')
+                    
+                    # Encrypt with flags=0 and sequence=random_key
+                    encrypted_msg = self.comm_encryptor.encrypt(
+                        msg_bytes,
+                        flags=0,
+                        channel=0,
+                        sequence=msg_key,
+                        offset=0
+                    )
+                    
+                    # Send to server
+                    self.usock.send(encrypted_msg)
+                    print(f"{self.__class__.__name__} sent message to server with key={msg_key}: {msg_content}")
+                    break  # Send one message per iteration
+                except Exception as e:
+                    print(f"{self.__class__.__name__} error sending message: {e}", file=sys.stderr)
+
         print('(CCH)', end='', flush=True)
         time.sleep(self.sync_sleep)
 
     def handle_message(self, msg):
         print(f"{self.__class__.__name__} received message: {msg}")
+        # Handle dictionary messages
+        if isinstance(msg, dict):
+            print(f"{self.__class__.__name__} processing dict message: {msg}")
+            if msg.get("cmd") == "bwup":
+                duration = msg.get("duration")
+                print(f"{self.__class__.__name__} received bwup command with duration={duration} seconds")
+                # Generate random key and store message
+                import random
+                random_key = random.randint(1000000, 9999999)
+                self.to_server_msgs[random_key] = {"bwup": duration}
+                print(f"{self.__class__.__name__} stored bwup message with key={random_key}")
+        # Handle enum messages
         if msg == CommMsg.STOP:
             return False
         return True
@@ -1963,10 +2050,9 @@ class ClientUpHandler(ClientPortHandler):
     def port_type(self):
         return(PortType.UPLOAD)
 
-    def iter(self):
-        if self.inpacket is not None:
-            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
-            self.inpacket = None
+    def iter(self,handled,flags, channel, sequence, offset, plaintext):
+        if sequence is not None and not handled:
+            print(f"{self.__class__.__name__} channel:{channel} sequence:{sequence} offset:{offset} plaintext:{plaintext}")
         print('(CUH)', end='', flush=True)
         time.sleep(self.sync_sleep)
 
@@ -1997,10 +2083,9 @@ class ClientDnHandler(ClientPortHandler):
     def port_type(self):
         return(PortType.DOWNLOAD)
 
-    def iter(self):
-        if self.inpacket is not None:
-            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
-            self.inpacket = None
+    def iter(self,handled,flags, channel, sequence, offset, plaintext):
+        if sequence is not None and not handled:
+            print(f"{self.__class__.__name__} channel:{channel} sequence:{sequence} offset:{offset} plaintext:{plaintext}")
         print('(CDH)', end='', flush=True)
         time.sleep(self.sync_sleep)
 
@@ -2232,7 +2317,11 @@ class BittrRtClient:
                                 try:
                                     while True:
                                         # Run the connection's run_once() to monitor handlers
-                                        if not client_conn.run_once():
+                                        # Pass bwup option from config
+                                        options = {}
+                                        if "bwup" in self.config:
+                                            options["bwup"] = self.config["bwup"]
+                                        if not client_conn.run_once(options):
                                             print("Client connection closed", file=sys.stderr)
                                             break
                                         time.sleep(1.0)
@@ -2479,7 +2568,7 @@ def main():
 
     # Validate unknown dash-arguments: any argument that starts with a dash
     # but is not a recognized CLI option should cause an error and exit.
-    known_args = set(cli_arg_map.keys()) | {"--sync-test", "--create-config", "--server"}
+    known_args = set(cli_arg_map.keys()) | {"--sync-test", "--create-config", "--server", "--bwup"}
     for arg in argv[1:]:
         if isinstance(arg, str) and arg.startswith("-") and arg not in known_args:
             print(f"Error: Unknown argument '{arg}'", file=sys.stderr)
@@ -2494,6 +2583,23 @@ def main():
     # Flags without values
     if "--sync-test" in argv:
         config["--sync-test"] = True
+    
+    # Parse --bwup argument (client only, defaults to 30 seconds)
+    if "--bwup" in argv:
+        idx = argv.index("--bwup")
+        if idx + 1 < len(argv):
+            try:
+                config["bwup"] = int(argv[idx + 1])
+            except ValueError:
+                print(f"Error: --bwup argument must be an integer (seconds)", file=sys.stderr)
+                sys.exit(1)
+        else:
+            # No value provided, use default
+            config["bwup"] = 30
+    else:
+        # Default value
+        config["bwup"] = 30
+    
     # If --server is provided, run in server mode; otherwise run client mode
     server_mode = "--server" in argv
 
