@@ -103,8 +103,8 @@ def demo_exchange():
     print(f"    Client encrypts: {client_message}")
     print(f"    Ciphertext: {base64.b64encode(client_encrypted).decode()[:60]}...")
     
-    # Server decrypts
-    server_decrypted_msg = server_ce.decrypt(client_encrypted)
+    # Server decrypts (returns flags, channel, sequence, offset, plaintext)
+    flags, channel, sequence, offset, server_decrypted_msg = server_ce.decrypt(client_encrypted)
     print(f"    Server decrypts: {server_decrypted_msg}")
     
     # Server sends encrypted message to client
@@ -113,8 +113,8 @@ def demo_exchange():
     print(f"    Server encrypts: {server_message}")
     print(f"    Ciphertext: {base64.b64encode(server_encrypted).decode()[:60]}...")
     
-    # Client decrypts
-    client_decrypted_msg = client_ce.decrypt(server_encrypted)
+    # Client decrypts (returns flags, channel, sequence, offset, plaintext)
+    flags, channel, sequence, offset, client_decrypted_msg = client_ce.decrypt(server_encrypted)
     print(f"    Client decrypts: {client_decrypted_msg}")
     
     print("\n" + "="*50)

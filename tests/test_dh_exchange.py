@@ -52,8 +52,8 @@ def test_encrypt_decrypt():
     plaintext = b"Hello, Bob! This is a secret message."
     ciphertext = alice.encrypt(plaintext)
     
-    # Bob decrypts it
-    decrypted = bob.decrypt(ciphertext)
+    # Bob decrypts it (decrypt now returns flags, channel, sequence, offset, plaintext)
+    flags, channel, sequence, offset, decrypted = bob.decrypt(ciphertext)
     
     assert decrypted == plaintext, f"Decryption failed: {decrypted} != {plaintext}"
     print("✓ Encryption/decryption works correctly")
@@ -74,8 +74,8 @@ def test_encrypt_decrypt_with_aad():
     # Encrypt with AAD
     ciphertext = alice.encrypt(plaintext, aad)
     
-    # Decrypt with matching AAD
-    decrypted = bob.decrypt(ciphertext, aad)
+    # Decrypt with matching AAD (decrypt returns flags, channel, sequence, offset, plaintext)
+    flags, channel, sequence, offset, decrypted = bob.decrypt(ciphertext, aad)
     assert decrypted == plaintext
     
     # Try to decrypt with wrong AAD (should fail)

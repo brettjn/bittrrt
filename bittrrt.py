@@ -1,5 +1,5 @@
-VERSION = "0.6"
-VERSION_NOTE = "Encrypted header fields (channel/sequence/offset) with payload in CommEncryptor; decrypt() now returns header + plaintext. Also heartbeat, stale detection, and port-recycle improvements."
+VERSION = "0.7"
+VERSION_NOTE = "Client now calculates and displays server latency from heartbeat messages with sequence=0 using server timestamps at positions 2 and 4."
 
 DEBUG_MODE = True
 
@@ -38,6 +38,26 @@ STALE_CYCLES_MAX     = 5          # number of stale cycles before connection is 
 STALE_CYCLES_MAX     = 10         # maximum number of stale cycles before considering a connection dead
 
 NET_OBS_KEY = 'OdiXEOXdvwgWfIizYjdEguhN-IP7eyqp9oITq_0MiBs='
+
+class PortType(Enum):
+    """Port types for client connections"""
+    CONTROL = "control"
+    UPLOAD = "upload"
+    DOWNLOAD = "download"
+
+class CommMsg(Enum):
+    START  = "start"
+    STOP   = "stop"
+    PAUSE  = "pause"
+    RESUME = "resume"
+
+class MsgFlags(Enum):
+    URGENT       = 0
+    HEARTBEAT    = 1
+    FLOW_CONTROL = 2
+    UNLOSSY      = 3
+    BINARY       = 4
+    DATA         = 5
 
 
 class DoCrypt:
@@ -115,7 +135,7 @@ class CommEncryptor:
         pub = ce.public_key_bytes  # 32 bytes
         ce.derive_shared_secret(peer_public_key_bytes)
         ciphertext = ce.encrypt(b"hello")
-        plaintext = ce.decrypt(ciphertext)
+        flags, channel, sequence, offset, plaintext = ce.decrypt(ciphertext)
     """
 
     def __init__(self):
@@ -159,12 +179,16 @@ class CommEncryptor:
         # Initialize ChaCha20Poly1305 cipher with derived key
         self.cipher = ChaCha20Poly1305(derived_key)
     
-    def encrypt(self, plaintext: bytes, associated_data: bytes = b'', channel: int = 0, sequence: int = 0, offset: int = 0) -> bytes:
+    def encrypt(self, plaintext: bytes, associated_data: bytes = b'', flags: int = 0, channel: int = 0, sequence: int = 0, offset: int = 0) -> bytes:
         """Encrypt plaintext using ChaCha20Poly1305.
         
         Args:
             plaintext: Data to encrypt
             associated_data: Optional associated data (authenticated but not encrypted)
+            flags: 1-byte flags field
+            channel: 3-byte channel identifier
+            sequence: 8-byte sequence number
+            offset: 8-byte offset
             
         Returns:
             Nonce (12 bytes) + ciphertext + tag (16 bytes)
@@ -175,8 +199,10 @@ class CommEncryptor:
         # Generate a random 12-byte nonce
         nonce = os.urandom(12)
 
-        # Pack channel (4 bytes unsigned), sequence (8 bytes unsigned), offset (8 bytes unsigned)
-        header = struct.pack('>IQQ', int(channel) & 0xFFFFFFFF, int(sequence) & 0xFFFFFFFFFFFFFFFF, int(offset) & 0xFFFFFFFFFFFFFFFF)
+        # Pack flags (1 byte), channel (3 bytes), sequence (8 bytes), offset (8 bytes)
+        # For 3-byte channel, we pack as 4 bytes then take the last 3 bytes
+        channel_bytes = struct.pack('>I', int(channel) & 0xFFFFFF)[1:]  # Take last 3 bytes
+        header = struct.pack('>B', int(flags) & 0xFF) + channel_bytes + struct.pack('>QQ', int(sequence) & 0xFFFFFFFFFFFFFFFF, int(offset) & 0xFFFFFFFFFFFFFFFF)
 
         # Prepend header to plaintext so header is encrypted/authenticated with the payload
         to_encrypt = header + plaintext
@@ -195,7 +221,7 @@ class CommEncryptor:
             associated_data: Optional associated data (must match encryption)
             
         Returns:
-            Decrypted plaintext
+            Tuple of (flags, channel, sequence, offset, plaintext)
             
         Raises:
             ValueError: If authentication fails or data is invalid
@@ -218,7 +244,7 @@ class CommEncryptor:
         except Exception as e:
             raise ValueError(f"Decryption failed: {e}")
 
-        # Decrypted payload must contain header (4+8+8 = 20 bytes) followed by plaintext
+        # Decrypted payload must contain header (1+3+8+8 = 20 bytes) followed by plaintext
         if len(decrypted) < 20:
             raise ValueError("Decrypted payload too short (missing header)")
 
@@ -226,24 +252,15 @@ class CommEncryptor:
         plaintext = decrypted[20:]
 
         try:
-            channel, sequence, offset = struct.unpack('>IQQ', header)
+            flags = struct.unpack('>B', header[0:1])[0]
+            # Reconstruct 3-byte channel by prepending a zero byte and unpacking as 4 bytes
+            channel = struct.unpack('>I', b'\x00' + header[1:4])[0]
+            sequence, offset = struct.unpack('>QQ', header[4:20])
         except Exception as e:
             raise ValueError(f"Failed to parse header fields: {e}")
 
         # Return header fields and plaintext bytes
-        return channel, sequence, offset, plaintext
-
-class PortType(Enum):
-    """Port types for client connections"""
-    CONTROL = "control"
-    UPLOAD = "upload"
-    DOWNLOAD = "download"
-
-class CommMsg(Enum):
-    START  = "start"
-    STOP   = "stop"
-    PAUSE  = "pause"
-    RESUME = "resume"
+        return flags, channel, sequence, offset, plaintext
 
 class SequenceSpan:
     """Represents a list of sequence number spans (beginning and ending pairs)"""
@@ -422,7 +439,7 @@ class DataSource(CommHandler):
         pass
 
 
-class Connection:
+class Connection(ABC):
     def __init__(self, config, port_manager):
         self.config          = config
          
@@ -430,9 +447,11 @@ class Connection:
         self.port_manager    = port_manager
         self.establish_start = time.perf_counter_ns() // 1_000_000  # milliseconds
         
+    @abstractmethod
     def run_once(self):
         raise NotImplementedError("run_once must be implemented by subclasses")
 
+    @abstractmethod
     def establish(self):
         raise NotImplementedError("establish must be implemented by subclasses")
 
@@ -597,8 +616,9 @@ class CommConnection(Connection):
     This class is a placeholder duplicate of `SyncTest` and can be
     specialized later for communication-specific behavior.
     """
-    def __init__(self, config, port_manager):
+    def __init__(self, config, port_manager, comm_encryptor=None):
         super().__init__(config, port_manager)
+        self.comm_encryptor                                       = comm_encryptor
         self.send_queues:  Dict[PortType, multiprocessing.Queue]  = None
         self.recv_queues:  Dict[PortType, multiprocessing.Queue]  = None
 
@@ -639,13 +659,13 @@ class CommConnection(Connection):
                     # Check if this is the first time we've seen this handler
                     if handler_name not in self.handler_inpacket_counts:
                         self.handler_inpacket_counts[handler_name] = new_count
-                        print(f"CommConnection: First count from {handler_name}: {new_count}")
+                        #print(f"CommConnection: First count from {handler_name}: {new_count}")
                     else:
                         # Check if count has increased
                         old_count = self.handler_inpacket_counts[handler_name]
                         if new_count > old_count:
                             any_count_increased = True
-                            print(f"CommConnection: {handler_name} count increased: {old_count} -> {new_count}")
+                            #print(f"CommConnection: {handler_name} count increased: {old_count} -> {new_count}")
                         self.handler_inpacket_counts[handler_name] = new_count
                 else:
                     print(f"CommConnection: received message from handler: {msg}")
@@ -712,7 +732,8 @@ class CommConnection(Connection):
                     self.send_queues,
                     self.recv_queues,
                     self.from_handler,
-                    self.config
+                    self.config,
+                    self.comm_encryptor
                 )
                 return
             
@@ -733,7 +754,8 @@ class CommConnection(Connection):
                     self.send_queues,
                     self.recv_queues,
                     self.from_handler,
-                    self.config
+                    self.config,
+                    self.comm_encryptor
                 )
                 return
             
@@ -753,7 +775,8 @@ class CommConnection(Connection):
                     self.send_queues,
                     self.recv_queues,
                     self.from_handler,
-                    self.config
+                    self.config,
+                    self.comm_encryptor
                 )
                 return
             
@@ -824,6 +847,252 @@ class CommConnection(Connection):
             print(f"CommConnection: Released dn_port {self.dn_port}: {released}")
             self.dn_port = None
 
+
+class ClientConnection(ABC):
+    def __init__(self, config):
+        self.config          = config
+         
+        self._established    = False
+        self.establish_start = time.perf_counter_ns() // 1_000_000  # milliseconds
+        
+    @abstractmethod
+    def run_once(self):
+        raise NotImplementedError("run_once must be implemented by subclasses")
+
+    @abstractmethod
+    def establish(self):
+        raise NotImplementedError("establish must be implemented by subclasses")
+
+
+class ClientCommConnection(ClientConnection):
+    """Client-side communication connection. Initially mirrors `CommConnection`."""
+    def __init__(self, config, server_addr, comm_encryptor=None):
+        super().__init__(config)
+        self.server_addr                                          = server_addr
+        self.comm_encryptor                                       = comm_encryptor
+        self.send_queues:  Dict[PortType, multiprocessing.Queue]  = None
+        self.recv_queues:  Dict[PortType, multiprocessing.Queue]  = None
+
+        self.ctrl_handler: Optional[ClientCtrlHandler]            = None
+        self.upld_handler:   Optional[ClientUpHandler]            = None
+        self.dnld_handler:   Optional[ClientDnHandler]            = None
+
+        self.from_handler                                         = multiprocessing.Queue()
+
+        self.sent_start_commands: bool                            = False
+        self.ctrl_port                                            = None
+        self.up_port                                              = None
+        self.dn_port                                              = None
+        
+        # Track inpacket counts from handlers for stale detection
+        self.handler_inpacket_counts: Dict[str, int]              = {}
+        self.stale_cycles                                         = 0
+
+    def run_once(self):
+        # minimal action for a comm connection
+        print("ClientCommConnection: run_once called")
+        if not self._established:
+            return True
+        
+        # Read all available notifications from handlers
+        any_count_increased = False
+        while True:
+            try:
+                msg = self.from_handler.get_nowait()
+                if isinstance(msg, dict) and "handler" in msg and "inpacket_count" in msg:
+                    handler_name = msg["handler"]
+                    new_count = msg["inpacket_count"]
+                    
+                    # Check if this is the first time we've seen this handler
+                    if handler_name not in self.handler_inpacket_counts:
+                        self.handler_inpacket_counts[handler_name] = new_count
+                        #print(f"ClientCommConnection: First count from {handler_name}: {new_count}")
+                    else:
+                        # Check if count has increased
+                        old_count = self.handler_inpacket_counts[handler_name]
+                        if new_count > old_count:
+                            any_count_increased = True
+                        self.handler_inpacket_counts[handler_name] = new_count
+                else:
+                    print(f"ClientCommConnection: received message from handler: {msg}")
+            except:
+                # No more messages in queue
+                break
+        
+        # Update stale cycles
+        if any_count_increased:
+            # Reset stale counter if any handler showed activity
+            if self.stale_cycles > 0:
+                print(f"ClientCommConnection: Resetting stale cycles (was {self.stale_cycles})")
+            self.stale_cycles = 0
+        else:
+            # Only increment if we have received at least one notification from each handler
+            expected_handlers = {"CtrlHandler", "UpHandler", "DnHandler"}
+            if expected_handlers.issubset(set(self.handler_inpacket_counts.keys())):
+                self.stale_cycles += 1
+                print(f"ClientCommConnection: Stale cycles: {self.stale_cycles}/{STALE_CYCLES_MAX}")
+                
+                if self.stale_cycles >= STALE_CYCLES_MAX:
+                    print(f"ClientCommConnection: Connection is stale (exceeded {STALE_CYCLES_MAX} cycles)", file=sys.stderr)
+                    return False
+        
+        return True
+        
+
+    def establish(self, ctrl_port, up_port, dn_port):
+        # For testing, establish once and return True so it gets moved
+        
+        msg=None
+        try:
+            msg=self.from_handler.get_nowait()
+        except:
+            pass
+
+        if msg:
+            print("ClientCommConnection: received message from handler:", msg)
+
+        if not self._established:
+            
+            if self.send_queues is None:
+                self.send_queues = {}
+                self.send_queues[PortType.CONTROL]  = multiprocessing.Queue()
+                self.send_queues[PortType.UPLOAD]   = multiprocessing.Queue()
+                self.send_queues[PortType.DOWNLOAD] = multiprocessing.Queue()
+
+            if self.recv_queues is None:
+                self.recv_queues = {}
+                self.recv_queues[PortType.CONTROL]  = multiprocessing.Queue()
+                self.recv_queues[PortType.UPLOAD]   = multiprocessing.Queue()
+                self.recv_queues[PortType.DOWNLOAD] = multiprocessing.Queue()
+
+
+            # Instantiate ctrl_handler if it doesn't exist
+            if self.ctrl_handler is None:
+                self.ctrl_port = ctrl_port
+                print(f"attempting to instantiate CLIENT_CTRL_HANDLER connecting to {self.server_addr}:{self.ctrl_port}")
+                if self.ctrl_port is None:
+                    print("ClientCommConnection: Failed to get control port")
+                    return False
+                self.ctrl_handler = ClientCtrlHandler(
+                    self.ctrl_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config,
+                    self.comm_encryptor,
+                    self.server_addr
+                )
+            
+            if not self.ctrl_handler.process.is_alive():
+                print("ClientCommConnection: Control handler process is not alive - removing")
+                self.ctrl_handler = None
+                return False
+            
+            # Instantiate upld_handler if it doesn't exist
+            if self.upld_handler is None:
+                self.up_port = up_port
+                print(f"attempting to instantiate CLIENT_UP_HANDLER connecting to {self.server_addr}:{self.up_port}")
+                if self.up_port is None:
+                    print("ClientCommConnection: Failed to get upload port")
+                    return False
+                self.upld_handler = ClientUpHandler(
+                    self.up_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config,
+                    self.comm_encryptor,
+                    self.server_addr
+                )
+            
+            if not self.upld_handler.process.is_alive():
+                print("ClientCommConnection: Upload handler process is not alive")
+                return False
+            
+            # Instantiate dnld_handler if it doesn't exist
+            if self.dnld_handler is None:
+                self.dn_port = dn_port
+                print(f"attempting to instantiate CLIENT_DN_HANDLER connecting to {self.server_addr}:{self.dn_port}")
+                if self.dn_port is None:
+                    print("ClientCommConnection: Failed to get download port")
+                    return False
+                self.dnld_handler = ClientDnHandler(
+                    self.dn_port,
+                    self.send_queues,
+                    self.recv_queues,
+                    self.from_handler,
+                    self.config,
+                    self.comm_encryptor,
+                    self.server_addr
+                )
+            
+            if not self.dnld_handler.process.is_alive():    
+                print("ClientCommConnection: Download handler process is not alive")
+                return False
+
+            if self.ctrl_handler.process.is_alive() and self.upld_handler.process.is_alive() and self.dnld_handler.process.is_alive():
+                print("ClientCommConnection: All handlers alive")
+                if not self.sent_start_commands:
+                    self.recv_queues[PortType.CONTROL].put(CommMsg.START)
+                    self.recv_queues[PortType.UPLOAD].put(CommMsg.START)
+                    self.recv_queues[PortType.DOWNLOAD].put(CommMsg.START)
+                    self.sent_start_commands = True
+                else:
+                    print("ClientCommConnection: establish successful SETTING _established = True")
+                    self._established = True
+                    return True
+                
+        return False
+
+    def close(self):
+        """Shutdown all handler subprocesses by sending STOP messages and waiting for them to terminate."""
+        handlers = [
+            (self.ctrl_handler, PortType.CONTROL, "Control"),
+            (self.upld_handler, PortType.UPLOAD, "Upload"),
+            (self.dnld_handler, PortType.DOWNLOAD, "Download")
+        ]
+        
+        # Send STOP messages to all alive handlers
+        for handler, port_type, name in handlers:
+            if handler is not None and handler.process.is_alive():
+                print(f"ClientCommConnection: Sending STOP to {name} handler")
+                self.recv_queues[port_type].put(CommMsg.STOP)
+        
+        # Wait for all processes to terminate
+        for handler, port_type, name in handlers:
+            if handler is not None:
+                if handler.process.is_alive():
+                    print(f"ClientCommConnection: Waiting for {name} handler to terminate...")
+                    handler.process.join(timeout=5.0)
+                    if handler.process.is_alive():
+                        print(f"ClientCommConnection: {name} handler did not terminate, forcing termination")
+                        handler.process.terminate()
+                        handler.process.join(timeout=1.0)
+                        if handler.process.is_alive():
+                            print(f"ClientCommConnection: {name} handler still alive, killing")
+                            handler.process.kill()
+                else:
+                    print(f"ClientCommConnection: {name} handler already terminated")
+        
+        print("ClientCommConnection: All handlers shut down")
+    
+    def release_ports(self):
+        """Return the three ports used by this connection back to the port manager."""
+        if self.ctrl_port is not None:
+            released = self.port_manager.release_port(self.ctrl_port)
+            print(f"ClientCommConnection: Released ctrl_port {self.ctrl_port}: {released}")
+            self.ctrl_port = None
+        
+        if self.up_port is not None:
+            released = self.port_manager.release_port(self.up_port)
+            print(f"ClientCommConnection: Released up_port {self.up_port}: {released}")
+            self.up_port = None
+        
+        if self.dn_port is not None:
+            released = self.port_manager.release_port(self.dn_port)
+            print(f"ClientCommConnection: Released dn_port {self.dn_port}: {released}")
+            self.dn_port = None
+
 class Client:
     def __init__(self, config, addr, client_pubkey_b64, pm, ary_connections):
         self.addr              = addr
@@ -844,7 +1113,7 @@ class Client:
         if pm.get_available_port_count() < 3:
             print("Error: Not enough available ports for Client (need >=3).", file=sys.stderr)
             raise RuntimeError("Not enough available ports for Client (need >=3).")
-        self.conn = CommConnection(self.config, pm)
+        self.conn = CommConnection(self.config, pm, self.ce)
         ary_connections.append(self.conn)
 
     def get_server_public_key_b64(self):
@@ -1101,8 +1370,9 @@ class BittrRt:
 
 
 class PortHandler(ABC):
-    def __init__(self, config):
+    def __init__(self, config, comm_encryptor=None):
         self.config             = config
+        self.comm_encryptor     = comm_encryptor
         self.sync_sleep         = 0
         self.inpacket           = None
         self.inpacket_count     = 0
@@ -1116,7 +1386,7 @@ class PortHandler(ABC):
         raise NotImplementedError("PortHandler.run_in_own_process() must be implemented by subclasses")
 
     @abstractmethod
-    def iter(self):
+    def iter(self,flags, channel, sequence, offset, plaintext):
         raise NotImplementedError("PortHandler.iter() must be implemented by subclasses")        
     
     @abstractmethod
@@ -1126,6 +1396,80 @@ class PortHandler(ABC):
     @abstractmethod
     def handle_message(self, msg):
         raise NotImplementedError("PortHandler.handle_message() must be implemented by subclasses")
+
+    def handle_heartbeat(self, payload: bytes, addr: tuple, flags: int, channel: int, sequence: int, offset: int):
+        """Handle heartbeat message by adding server timestamp and echoing back.
+        
+        The echo counter is now stored in the sequence number (in the header).
+        When echoing back, the server appends a binary server timestamp to the data.
+        When sequence==1, calculates both client and server latencies.
+        
+        Args:
+            payload: The decrypted payload containing client timestamp (8 bytes binary)
+            addr: The address to send the response to
+            flags: The flags from the received packet
+            channel: The channel from the received packet
+            sequence: The sequence number (used as echo counter)
+            offset: The offset from the received packet
+        """
+        try:
+            # The sequence number is the echo counter
+            echo = sequence
+            
+            # If echo == 1, this is the final echo - calculate latencies
+            if echo == 1:
+                # Extract timestamps from payload
+                # payload should contain: [client_ts_send, server_ts_send, client_ts_return]
+                num_timestamps = len(payload) // 8
+                if num_timestamps >= 3:
+                    timestamps = []
+                    for i in range(num_timestamps):
+                        ts_bytes = payload[i*8:(i+1)*8]
+                        timestamp = struct.unpack('>Q', ts_bytes)[0]
+                        timestamps.append(timestamp)
+                    
+                    current_time = time.time_ns() // 1_000_000  # milliseconds
+                    
+                    # Client latency: time between client sending (ts[0]) and client receiving back (ts[2])
+                    client_latency = timestamps[2] - timestamps[0]
+                    
+                    # Server latency: time between server receiving (ts[1]) and now
+                    server_latency = current_time - timestamps[1]
+                    
+                    print(f"{self.__class__.__name__} HEARTBEAT latencies - Client: {client_latency}ms, Server: {server_latency}ms (from {addr[0]}:{addr[1]})", file=sys.stderr)
+                else:
+                    print(f"{self.__class__.__name__} HEARTBEAT with sequence=1 but insufficient timestamps ({num_timestamps})", file=sys.stderr)
+            
+            # Only respond if echo counter is greater than zero
+            if echo > 0:
+                # Get server timestamp in milliseconds
+                server_timestamp = time.time_ns() // 1_000_000
+                # Pack as binary (8 bytes, big-endian)
+                server_timestamp_bytes = struct.pack('>Q', server_timestamp)
+                
+                # Append server timestamp to the existing payload
+                # Payload already contains client timestamp (8 bytes)
+                response_payload = payload + server_timestamp_bytes
+                
+                # Encrypt with URGENT, HEARTBEAT, and BINARY flags
+                heartbeat_flags = (1 << MsgFlags.URGENT.value) | (1 << MsgFlags.HEARTBEAT.value) | (1 << MsgFlags.BINARY.value)
+                
+                # Reduce echo counter by one for the response sequence
+                encrypted = self.comm_encryptor.encrypt(
+                    response_payload,
+                    flags=heartbeat_flags,
+                    channel=channel,
+                    sequence=echo - 1,
+                    offset=offset
+                )
+                
+                # Send back to client
+                self.usock.sendto(encrypted, addr)
+                #print(f"{self.__class__.__name__} sent heartbeat response to {addr}: echo={echo-1}", file=sys.stderr)
+        except Exception as e:
+            print(f"{self.__class__.__name__} error in handle_heartbeat: {e}", file=sys.stderr)
+            stack_trace = traceback.format_exc()
+            print(stack_trace, file=sys.stderr)
 
     def run(self):
         """Main loop for the handler."""
@@ -1174,12 +1518,29 @@ class PortHandler(ABC):
                     except Exception as e:
                         print(f"Error in {self.__class__.__name__} run loop: {e}", file=sys.stderr)
 
+                    handled = False
+                    flags, channel, sequence, offset, plaintext = None, None, None, None, None
                     try:
                         data, addr = self.usock.recvfrom(1500)
-                        # Print received heartbeat to stderr
-                        print(f"{self.__class__.__name__} received heartbeat from {addr}: {data.decode('utf-8', errors='ignore')}", file=sys.stderr)
+                        handled = False
                         self.inpacket = data
                         self.inpacket_count += 1
+                        
+                        # Decrypt packet if comm_encryptor is available
+                        if self.comm_encryptor is not None:
+                            try:
+                                flags, channel, sequence, offset, plaintext = self.comm_encryptor.decrypt(data)
+                                
+                                # Check if HEARTBEAT flag is set
+                                if flags & (1 << MsgFlags.HEARTBEAT.value):
+                                    #print(f"{self.__class__.__name__} received HEARTBEAT from {addr[0]}:{addr[1]} sequence={sequence}", file=sys.stderr)
+                                    self.handle_heartbeat(plaintext, addr, flags, channel, sequence, offset)
+                                    handled = True  
+                            except Exception as e:
+                                print(f"{self.__class__.__name__} decryption failed: {e}", file=sys.stderr)
+                        else:
+                            # Legacy behavior for non-encrypted packets
+                            print(f"{self.__class__.__name__} received data from {addr}: {data.decode('utf-8', errors='ignore')}", file=sys.stderr)
                     except socket.timeout:
                         pass
                     except Exception as e:
@@ -1198,7 +1559,9 @@ class PortHandler(ABC):
                         except Exception as e:
                             print(f"Error sending notification from {self.__class__.__name__}: {e}", file=sys.stderr)
 
-                    self.iter()
+                    if not handled and sequence is not None:
+                        self.iter(flags, channel, sequence, offset, plaintext)
+
             except KeyboardInterrupt:
                 # Gracefully handle CTRL-C in subprocess
                 pass
@@ -1212,8 +1575,8 @@ class PortHandler(ABC):
 
 class CtrlHandler(PortHandler):
     """Handler for control port communication"""
-    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config):
-        super().__init__(config)
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config, comm_encryptor=None):
+        super().__init__(config, comm_encryptor)
 
         self.port       = port
         self.send_queue = send_queue
@@ -1225,9 +1588,9 @@ class CtrlHandler(PortHandler):
     def port_type(self):
         return(PortType.CONTROL)
 
-    def iter(self):
+    def iter(self,flags, channel, sequence, offset, plaintext):
         if self.inpacket is not None:
-            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            print(f"{self.__class__.__name__} Port:{self.port} sequence={sequence} plaintext={plaintext}", file=sys.stderr)
             self.inpacket = None
         print('(CH)', end='', flush=True)
         time.sleep(self.sync_sleep)    
@@ -1244,11 +1607,10 @@ class CtrlHandler(PortHandler):
         self.process = multiprocessing.Process(target=self.run)
         self.process.start()
 
-
 class UpHandler(PortHandler):
     """Handler for upload port communication"""
-    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config):
-        super().__init__(config)
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config, comm_encryptor=None):
+        super().__init__(config, comm_encryptor)
 
         self.port       = port
         self.send_queue = send_queue
@@ -1260,9 +1622,9 @@ class UpHandler(PortHandler):
     def port_type(self):
         return(PortType.UPLOAD)
 
-    def iter(self):
+    def iter(self,flags, channel, sequence, offset, plaintext):
         if self.inpacket is not None:
-            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            print(f"{self.__class__.__name__} Port:{self.port} sequence={sequence} plaintext={plaintext}", file=sys.stderr)
             self.inpacket = None
         print('(UH)', end='', flush=True)
         time.sleep(self.sync_sleep)    
@@ -1282,8 +1644,8 @@ class UpHandler(PortHandler):
 
 class DnHandler(PortHandler):
     """Handler for download port communication"""
-    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config):
-        super().__init__(config)
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config, comm_encryptor=None):
+        super().__init__(config, comm_encryptor)
 
         self.port       = port
         self.send_queue = send_queue
@@ -1295,9 +1657,9 @@ class DnHandler(PortHandler):
     def port_type(self):
         return(PortType.DOWNLOAD)
 
-    def iter(self):
+    def iter(self,flags, channel, sequence, offset, plaintext):
         if self.inpacket is not None:
-            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            print(f"{self.__class__.__name__} Port:{self.port} sequence={sequence} plaintext={plaintext}", file=sys.stderr)
             self.inpacket = None
         print('(DH)', end='', flush=True)
         time.sleep(self.sync_sleep)    
@@ -1313,6 +1675,346 @@ class DnHandler(PortHandler):
         """Run this handler in its own process."""
         self.process = multiprocessing.Process(target=self.run)
         self.process.start()
+
+
+class ClientPortHandler(ABC):
+    """Base client-side port handler (abstract).
+
+    This mirrors the minimal state initialized by `PortHandler.__init__`
+    so client-side handlers behave like server-side ones.
+    """
+    def __init__(self, config, comm_encryptor=None):
+        self.config             = config
+        self.comm_encryptor     = comm_encryptor
+        self.sync_sleep         = 0
+        self.inpacket           = None
+        self.inpacket_count     = 0
+        self.last_notify_time   = None
+        self.last_heartbeat     = None
+
+        if "--sync-test" in self.config:
+            self.sync_sleep = SYNC_TEST_SLEEP
+
+    def handle_client_heartbeat(self, payload: bytes, addr: tuple, flags: int, channel: int, sequence: int, offset: int):
+        """Handle heartbeat response from server.
+        
+        Calculates latency and optionally echoes back with additional timestamp.
+        
+        Args:
+            payload: Binary data containing timestamps
+            addr: The address of the server
+            flags: The flags from the received packet
+            channel: The channel from the received packet
+            sequence: The sequence number (echo counter)
+            offset: The offset from the received packet
+        """
+        try:
+            # Extract timestamps from payload (each is 8 bytes)
+            num_timestamps = len(payload) // 8
+            timestamps = []
+            for i in range(num_timestamps):
+                ts_bytes = payload[i*8:(i+1)*8]
+                timestamp = struct.unpack('>Q', ts_bytes)[0]
+                timestamps.append(timestamp)
+            
+            # If sequence is 0, this is the final heartbeat - calculate server latency
+            if sequence == 0 and len(timestamps) >= 4:
+                # Timestamps: [client_ts1, server_ts1, client_ts2, server_ts2]
+                # Server latency: difference between server's two timestamps (positions 2 and 4)
+                server_latency = timestamps[3] - timestamps[1]
+                print(f"{self.__class__.__name__} HEARTBEAT server latency: {server_latency}ms (from {addr[0]}:{addr[1]})", file=sys.stderr)
+            # Calculate latency if we have at least 2 timestamps
+            elif len(timestamps) >= 2:
+                # timestamps[0] is our original send time
+                # timestamps[1] is server's receive/send time
+                current_time = time.time_ns() // 1_000_000  # milliseconds
+                round_trip_latency = current_time - timestamps[0]
+                print(f"{self.__class__.__name__} heartbeat latency: {round_trip_latency}ms (seq={sequence})", file=sys.stderr)
+            
+            # If echo counter (sequence) > 0, echo back with our timestamp
+            if sequence > 0:
+                # Get current timestamp
+                current_timestamp = time.time_ns() // 1_000_000
+                current_timestamp_bytes = struct.pack('>Q', current_timestamp)
+                
+                # Append our timestamp to the existing payload
+                response_payload = payload + current_timestamp_bytes
+                
+                # Encrypt with URGENT, HEARTBEAT, and BINARY flags
+                heartbeat_flags = (1 << MsgFlags.URGENT.value) | (1 << MsgFlags.HEARTBEAT.value) | (1 << MsgFlags.BINARY.value)
+                
+                # Reduce echo counter by one
+                encrypted = self.comm_encryptor.encrypt(
+                    response_payload,
+                    flags=heartbeat_flags,
+                    channel=channel,
+                    sequence=sequence - 1,
+                    offset=offset
+                )
+                
+                # Send back to server
+                self.usock.send(encrypted)
+                #print(f"{self.__class__.__name__} echoed heartbeat back to server: echo={sequence-1}", file=sys.stderr)
+        except Exception as e:
+            print(f"{self.__class__.__name__} error in handle_client_heartbeat: {e}", file=sys.stderr)
+            stack_trace = traceback.format_exc()
+            print(stack_trace, file=sys.stderr)
+
+    def run(self):
+        """Main loop for the client handler (connects instead of binds)."""
+        try:
+            self.usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Client handlers connect to remote server, not bind locally
+            # Note: UDP "connect" just sets the default destination
+            self.usock.connect((self.server_addr, self.port))
+            print(f"{self.__class__.__name__} connected to {self.server_addr}:{self.port}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error setting up socket in {self.__class__.__name__}: {e}", file=sys.stderr)
+            return
+        
+        msg_from_comm = self.recv_queue[self.port_type()].get()
+        print(f"{self.__class__.__name__} received initial message from comm queue: {msg_from_comm}")
+        if msg_from_comm==CommMsg.START:
+            try:
+                # Set socket timeout for non-blocking receives
+                if PORT_HANDLER_DELAY > 0:
+                    self.usock.settimeout(PORT_HANDLER_DELAY / 1000.0)
+                    print(f"{self.__class__.__name__} socket timeout set to {PORT_HANDLER_DELAY} ms")
+            except Exception as e:
+                print(f"Error setting socket timeout in {self.__class__.__name__}: {e}", file=sys.stderr)
+                stack_trace = traceback.format_exc()
+                print(stack_trace, file=sys.stderr)
+                sys.stderr.flush()  
+                return
+            
+            running = True
+            self.last_notify_time = time.perf_counter_ns() // 1_000_000  # milliseconds
+            try:
+                while running:
+                    try:
+                        # Process incoming messages
+                        if not self.recv_queue[self.port_type()].empty():
+                            msg = self.recv_queue[self.port_type()].get()
+                            should_continue = self.handle_message(msg)
+                            if should_continue is False:
+                                running = False
+                                break
+                    except Exception as e:
+                        print(f"Error in {self.__class__.__name__} run loop: {e}", file=sys.stderr)
+
+                    handled = False
+                    flags, channel, sequence, offset, plaintext = None, None, None, None, None
+                    try:
+                        # For connected UDP sockets, use recv() instead of recvfrom()
+                        flags, channel, sequence, offset, plaintext = None, None, None, None, None
+                        data = self.usock.recv(1500)
+                        handled = False
+                        addr = (self.server_addr, self.port)  # We know where it came from
+                        self.inpacket = data
+                        self.inpacket_count += 1
+                        
+                        # Decrypt packet if comm_encryptor is available
+                        if self.comm_encryptor is not None:
+                            try:
+                                flags, channel, sequence, offset, plaintext = self.comm_encryptor.decrypt(data)
+                                
+                                # Check if HEARTBEAT flag is set
+                                if flags & (1 << MsgFlags.HEARTBEAT.value):
+                                    #print(f"{self.__class__.__name__} received HEARTBEAT from {addr}", file=sys.stderr)
+                                    # Handle heartbeat response from server
+                                    self.handle_client_heartbeat(plaintext, addr, flags, channel, sequence, offset)
+                                    handled = True
+
+                            except Exception as e:
+                                print(f"{self.__class__.__name__} decryption failed: {e}", file=sys.stderr)
+                            
+                        else:
+                            # Legacy behavior for non-encrypted packets
+                            print(f"{self.__class__.__name__} received data from {addr}: {data.decode('utf-8', errors='ignore')}", file=sys.stderr)
+                    except socket.timeout:
+                        pass
+                    except Exception as e:
+                        print(f"Error receiving data in {self.__class__.__name__}: {e}", file=sys.stderr)
+
+                    # Check if it's time to send notification to ClientCommConnection
+                    current_time = time.perf_counter_ns() // 1_000_000  # milliseconds
+                    if current_time - self.last_notify_time >= NOTIFY_DELAY:
+                        self.last_notify_time = current_time
+                        notification = {
+                            "handler": self.__class__.__name__,
+                            "inpacket_count": self.inpacket_count
+                        }
+                        try:
+                            self.to_comm.put_nowait(notification)
+                        except Exception as e:
+                            print(f"Error sending notification from {self.__class__.__name__}: {e}", file=sys.stderr)
+
+                    # Check if it's time to send a heartbeat
+                    heartbeat_rate = self.config.get("heartbeat_rate", 5000)  # Default 5 seconds in ms
+                    if isinstance(heartbeat_rate, str):
+                        try:
+                            heartbeat_rate = int(heartbeat_rate)
+                        except:
+                            heartbeat_rate = 5000
+                    
+                    if self.last_heartbeat is None or (current_time - self.last_heartbeat) >= heartbeat_rate:
+                        if self.comm_encryptor is not None:
+                            try:
+                                # Get timestamp for latency calculation (milliseconds)
+                                timestamp = time.time_ns() // 1_000_000
+                                # Pack timestamp as binary data (8 bytes, big-endian)
+                                timestamp_data = struct.pack('>Q', timestamp)
+                                
+                                # Set URGENT, HEARTBEAT, and BINARY flags
+                                flags = (1 << MsgFlags.URGENT.value) | (1 << MsgFlags.HEARTBEAT.value) | (1 << MsgFlags.BINARY.value)
+                                
+                                # Encrypt with sequence number 3
+                                encrypted_heartbeat = self.comm_encryptor.encrypt(
+                                    timestamp_data,
+                                    flags=flags,
+                                    channel=0,
+                                    sequence=3,
+                                    offset=0
+                                )
+                                
+                                # Send to server (UDP socket is already connected)
+                                self.usock.send(encrypted_heartbeat)
+                                self.last_heartbeat = current_time
+                                #print(f"{self.__class__.__name__} sent heartbeat to {self.server_addr}:{self.port}", file=sys.stderr)
+                            except Exception as e:
+                                print(f"{self.__class__.__name__} error sending heartbeat: {e}", file=sys.stderr)
+
+                    if not handled and sequence is not None:
+                        self.iter()
+            except KeyboardInterrupt:
+                # Gracefully handle CTRL-C in subprocess
+                pass
+            
+            print(f"{self.__class__.__name__} shutting down")
+            try:
+                self.usock.close()
+            except:
+                pass
+
+    @abstractmethod
+    def run_in_own_process(self):
+        raise NotImplementedError("ClientPortHandler.run_in_own_process() must be implemented by subclasses")
+
+    @abstractmethod
+    def iter(self):
+        raise NotImplementedError("ClientPortHandler.iter() must be implemented by subclasses")
+
+    @abstractmethod
+    def port_type(self):
+        raise NotImplementedError("ClientPortHandler.port_type() must be implemented by subclasses")
+
+    @abstractmethod
+    def handle_message(self, msg):
+        raise NotImplementedError("ClientPortHandler.handle_message() must be implemented by subclasses")
+
+
+class ClientCtrlHandler(ClientPortHandler):
+    """Client-side control port handler (same as `CtrlHandler`)."""
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config, comm_encryptor=None, server_addr=None):
+        super().__init__(config, comm_encryptor)
+
+        self.port       = port
+        self.send_queue = send_queue
+        self.recv_queue = recv_queue
+        self.to_comm    = to_comm
+        self.server_addr = server_addr
+
+        self.run_in_own_process()
+
+    def port_type(self):
+        return(PortType.CONTROL)
+
+    def iter(self):
+        if self.inpacket is not None:
+            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            self.inpacket = None
+        print('(CCH)', end='', flush=True)
+        time.sleep(self.sync_sleep)
+
+    def handle_message(self, msg):
+        print(f"{self.__class__.__name__} received message: {msg}")
+        if msg == CommMsg.STOP:
+            return False
+        return True
+
+    def run_in_own_process(self):
+        self.process = multiprocessing.Process(target=self.run)
+        self.process.start()
+
+
+class ClientUpHandler(ClientPortHandler):
+    """Client-side upload port handler (same as `UpHandler`)."""
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config, comm_encryptor=None, server_addr=None):
+        super().__init__(config, comm_encryptor)
+
+        self.port       = port
+        self.send_queue = send_queue
+        self.recv_queue = recv_queue
+        self.to_comm    = to_comm
+        self.server_addr = server_addr
+
+        self.run_in_own_process()
+
+    def port_type(self):
+        return(PortType.UPLOAD)
+
+    def iter(self):
+        if self.inpacket is not None:
+            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            self.inpacket = None
+        print('(CUH)', end='', flush=True)
+        time.sleep(self.sync_sleep)
+
+    def handle_message(self, msg):
+        print(f"{self.__class__.__name__} received message: {msg}")
+        if msg == CommMsg.STOP:
+            return False
+        return True
+
+    def run_in_own_process(self):
+        self.process = multiprocessing.Process(target=self.run)
+        self.process.start()
+
+
+class ClientDnHandler(ClientPortHandler):
+    """Client-side download port handler (same as `DnHandler`)."""
+    def __init__(self, port: int, send_queue: multiprocessing.Queue, recv_queue: multiprocessing.Queue, to_comm: multiprocessing.Queue, config, comm_encryptor=None, server_addr=None):
+        super().__init__(config, comm_encryptor)
+
+        self.port       = port
+        self.send_queue = send_queue
+        self.recv_queue = recv_queue
+        self.to_comm    = to_comm
+        self.server_addr = server_addr
+
+        self.run_in_own_process()
+
+    def port_type(self):
+        return(PortType.DOWNLOAD)
+
+    def iter(self):
+        if self.inpacket is not None:
+            print(f"{self.__class__.__name__} received packet: {self.inpacket}")
+            self.inpacket = None
+        print('(CDH)', end='', flush=True)
+        time.sleep(self.sync_sleep)
+
+    def handle_message(self, msg):
+        print(f"{self.__class__.__name__} received message: {msg}")
+        if msg == CommMsg.STOP:
+            return False
+        return True
+
+    def run_in_own_process(self):
+        self.process = multiprocessing.Process(target=self.run)
+        self.process.start()
+
+
 
 class PortManager:
     """Manage available port numbers using SequenceSpan.
@@ -1428,9 +2130,11 @@ class BittrRtClient:
     `run()` which returns True on success, False on failure.
     """
 
-    def __init__(self, argv, net_obs_key=NET_OBS_KEY):
+    def __init__(self, argv, config=None, net_obs_key=NET_OBS_KEY):
         self.argv = list(argv)
         self.net_obs_key = net_obs_key
+        # Keep a reference to the merged config (file + CLI overrides)
+        self.config = config or {}
 
     def _parse_target(self):
         address = "127.0.0.1"
@@ -1473,6 +2177,9 @@ class BittrRtClient:
             print(f"Error: failed to encrypt payload: {e}", file=sys.stderr)
             return False
         
+        # Create ClientCommConnection for managing handlers
+        client_conn = None
+        
         send_timestamp = None
 
         try:
@@ -1496,7 +2203,7 @@ class BittrRtClient:
                         # We've already got the pubkey, so this should be the port numbers
                         # Try to decrypt using CommEncryptor (binary data, not UTF-8 encoded)
                         try:
-                            channel, sequence, offset, decrypted_port_data = ce.decrypt(response_data)
+                            flags, channel, sequence, offset, decrypted_port_data = ce.decrypt(response_data)
                             port_info = json.loads(decrypted_port_data.decode('utf-8'))
 
                             if port_info.get("cmd") == "ports":
@@ -1504,11 +2211,36 @@ class BittrRtClient:
                                 up_port = port_info.get("up_port")
                                 dn_port = port_info.get("dn_port")
 
-                                print(f"Received port numbers: ctrl={ctrl_port}, up={up_port}, dn={dn_port} (hdr: ch={channel}, seq={sequence}, off={offset})", file=sys.stderr)
+                                print(f"Received port numbers: ctrl={ctrl_port}, up={up_port}, dn={dn_port} (hdr: flags={flags}, ch={channel}, seq={sequence}, off={offset})", file=sys.stderr)
 
-                                # Start heartbeat to the three ports
-                                self._start_heartbeat(address, ctrl_port, up_port, dn_port)
+                                # Create ClientCommConnection if not already created
+                                if client_conn is None:
+                                    client_conn = ClientCommConnection(self.config, address, ce)
+                                
+                                # Establish connection with port numbers
+                                print("Establishing client connection with handlers...", file=sys.stderr)
+                                # Call establish repeatedly until connection is established
+                                for _ in range(10):
+                                    if client_conn.establish(ctrl_port, up_port, dn_port):
+                                        print("Client connection established!", file=sys.stderr)
+                                        break
+                                    time.sleep(0.1)
+                                
                                 sock.close()
+                                
+                                # Keep connection alive
+                                try:
+                                    while True:
+                                        # Run the connection's run_once() to monitor handlers
+                                        if not client_conn.run_once():
+                                            print("Client connection closed", file=sys.stderr)
+                                            break
+                                        time.sleep(1.0)
+                                except KeyboardInterrupt:
+                                    print("\nClient stopped by user", file=sys.stderr)
+                                finally:
+                                    client_conn.close()
+                                
                                 return True
                         except Exception as e:
                             print(f"Error decrypting port data: {e}", file=sys.stderr)
@@ -1560,23 +2292,24 @@ class BittrRtClient:
             print(f"Error sending UDP packet to {address}:{port}: {e}", file=sys.stderr)
             return False
     
-    def _start_heartbeat(self, address, ctrl_port, up_port, dn_port):
-        """Start sending heartbeat messages to the three ports."""
-        # Read heartbeat_rate from config or use default
-        config_path = os.path.expanduser("~/.bittrrt/config")
-        heartbeat_rate = 5000  # Default: 5 seconds in milliseconds
+    def _start_heartbeat(self, address, ctrl_port, up_port, dn_port, ce):
+        """Start sending heartbeat messages to the three ports.
         
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        if key.strip() == "heartbeat_rate":
-                            try:
-                                heartbeat_rate = int(value.strip())
-                            except ValueError:
-                                pass
+        Args:
+            address: Server address
+            ctrl_port: Control port number
+            up_port: Upload port number
+            dn_port: Download port number
+            ce: CommEncryptor instance for encrypting heartbeat messages
+        """
+        # Read heartbeat_rate from provided config or use default
+        heartbeat_rate = 5000  # Default: 5 seconds in milliseconds
+        try:
+            if isinstance(self.config, dict) and "heartbeat_rate" in self.config:
+                heartbeat_rate = int(self.config.get("heartbeat_rate", heartbeat_rate))
+        except Exception:
+            # keep default on any parse error
+            heartbeat_rate = 5000
         
         # Create three UDP sockets
         try:
@@ -1589,11 +2322,41 @@ class BittrRtClient:
             # Send heartbeats in a loop
             heartbeat_count = 0
             while True:
-                heartbeat_msg = f"heartbeat-{heartbeat_count}".encode('utf-8')
+                # Create heartbeat payload with timestamp and echo value
+                timestamp = time.time_ns() // 1_000_000  # milliseconds
+                heartbeat_payload = f"client_ts3={timestamp} echo=2"
                 
-                ctrl_sock.sendto(heartbeat_msg, (address, ctrl_port))
-                up_sock.sendto(heartbeat_msg, (address, up_port))
-                dn_sock.sendto(heartbeat_msg, (address, dn_port))
+                # Set URGENT and HEARTBEAT flags
+                flags = (1 << MsgFlags.URGENT.value) | (1 << MsgFlags.HEARTBEAT.value)
+                
+                # Encrypt heartbeat messages
+                encrypted_ctrl = ce.encrypt(
+                    heartbeat_payload.encode('utf-8'),
+                    flags=flags,
+                    channel=0,  # Control channel
+                    sequence=heartbeat_count,
+                    offset=0
+                )
+                
+                encrypted_up = ce.encrypt(
+                    heartbeat_payload.encode('utf-8'),
+                    flags=flags,
+                    channel=1,  # Upload channel
+                    sequence=heartbeat_count,
+                    offset=0
+                )
+                
+                encrypted_dn = ce.encrypt(
+                    heartbeat_payload.encode('utf-8'),
+                    flags=flags,
+                    channel=2,  # Download channel
+                    sequence=heartbeat_count,
+                    offset=0
+                )
+                
+                ctrl_sock.sendto(encrypted_ctrl, (address, ctrl_port))
+                up_sock.sendto(encrypted_up, (address, up_port))
+                dn_sock.sendto(encrypted_dn, (address, dn_port))
                 
                 heartbeat_count += 1
                 time.sleep(heartbeat_rate / 1000.0)  # Convert ms to seconds
@@ -1735,8 +2498,8 @@ def main():
     server_mode = "--server" in argv
 
     if not server_mode:
-        # Client mode: delegate to BittrRtClient
-        client = BittrRtClient(argv)
+        # Client mode: delegate to BittrRtClient, pass merged config so client can read heartbeat_rate
+        client = BittrRtClient(argv, config)
         success = client.run()
         sys.exit(0 if success else 1)
 
