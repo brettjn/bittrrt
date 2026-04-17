@@ -37,6 +37,9 @@ NOTIFY_DELAY         = 2000       # milliseconds - how often port handlers notif
 STALE_CYCLES_MAX     = 5          # number of stale cycles before connection is considered dead
 STALE_CYCLES_MAX     = 10         # maximum number of stale cycles before considering a connection dead
 
+STATISTIC_DELAY            = 1000  # delay in between bandwidth statistics
+CONNECTION_REFUSED_TIMEOUT = 5000  # milliseconds
+
 NET_OBS_KEY = 'OdiXEOXdvwgWfIizYjdEguhN-IP7eyqp9oITq_0MiBs='
 
 class PortType(Enum):
@@ -925,7 +928,7 @@ class ClientCommConnection(ClientConnection):
                     # Check if this is the first time we've seen this handler
                     if handler_name not in self.handler_inpacket_counts:
                         self.handler_inpacket_counts[handler_name] = new_count
-                        #print(f"ClientCommConnection: First count from {handler_name}: {new_count}")
+                        print(f"ClientCommConnection: First count from {handler_name}: {new_count}")
                     else:
                         # Check if count has increased
                         old_count = self.handler_inpacket_counts[handler_name]
@@ -946,7 +949,7 @@ class ClientCommConnection(ClientConnection):
             self.stale_cycles = 0
         else:
             # Only increment if we have received at least one notification from each handler
-            expected_handlers = {"CtrlHandler", "UpHandler", "DnHandler"}
+            expected_handlers = {"ClientCtrlHandler", "ClientUpHandler", "ClientDnHandler"}
             if expected_handlers.issubset(set(self.handler_inpacket_counts.keys())):
                 self.stale_cycles += 1
                 print(f"ClientCommConnection: Stale cycles: {self.stale_cycles}/{STALE_CYCLES_MAX}")
@@ -1396,6 +1399,8 @@ class PortHandler(ABC):
         self.inpacket           = None
         self.inpacket_count     = 0
         self.last_notify_time   = None  # Track when we last sent notification
+        self.msg_seq_buffer     = []    # Circular buffer for client message sequences (size 20)
+        self.msg_seq_buffer_size = 20
 
         if "--sync-test" in self.config:
             self.sync_sleep = SYNC_TEST_SLEEP
@@ -1553,13 +1558,9 @@ class PortHandler(ABC):
                                 # Check if flags=0 (message requiring ACK)
                                 if flags == 0:
                                     print(f"{self.__class__.__name__} received message with flags=0, sequence={sequence} from {addr[0]}:{addr[1]}", file=sys.stderr)
-                                    try:
-                                        msg_content = json.loads(plaintext.decode('utf-8'))
-                                        print(f"{self.__class__.__name__} message content: {msg_content}", file=sys.stderr)
-                                    except:
-                                        pass
                                     
-                                    # Send ACK response
+                                    
+                                    # Always send ACK response
                                     ack_flags = (1 << MsgFlags.ACK.value)
                                     ack_payload = b'ACK'
                                     encrypted_ack = self.comm_encryptor.encrypt(
@@ -1571,7 +1572,7 @@ class PortHandler(ABC):
                                     )
                                     self.usock.sendto(encrypted_ack, addr)
                                     print(f"{self.__class__.__name__} sent ACK with sequence={sequence} to {addr[0]}:{addr[1]}", file=sys.stderr)
-                                    handled = True
+                                    handled = False
                                 
                                 # Check if HEARTBEAT flag is set
                                 if flags & (1 << MsgFlags.HEARTBEAT.value):
@@ -1631,6 +1632,44 @@ class CtrlHandler(PortHandler):
         return(PortType.CONTROL)
 
     def iter(self,flags, channel, sequence, offset, plaintext):
+        if flags==0:
+            # Check circular buffer for duplicate detection
+            should_act = False
+            if sequence not in self.msg_seq_buffer:
+                # Sequence not in buffer
+                if len(self.msg_seq_buffer) < self.msg_seq_buffer_size:
+                    # Buffer not full, act on message
+                    should_act = True
+                else:
+                    # Buffer is full, only act if sequence > all buffer entries
+                    if sequence > max(self.msg_seq_buffer):
+                        should_act = True
+            
+            if should_act:
+                # Act on the message (print it)
+                try:
+                    msg_content = json.loads(plaintext.decode('utf-8'))
+                    print(f"{self.__class__.__name__} ACTING on message content: {msg_content}", file=sys.stderr)
+                    
+                    # Check if this is a BWUP message and forward to upload handler
+                    if "bwup" in msg_content:
+                        try:
+                            self.recv_queue[PortType.UPLOAD].put_nowait(msg_content)
+                            print(f"{self.__class__.__name__} forwarded BWUP message to upload handler", file=sys.stderr)
+                        except Exception as e:
+                            print(f"{self.__class__.__name__} error forwarding BWUP to upload handler: {e}", file=sys.stderr)
+                except:
+                    pass
+                
+                # Add sequence to circular buffer
+                if len(self.msg_seq_buffer) >= self.msg_seq_buffer_size:
+                    # Remove oldest entry
+                    self.msg_seq_buffer.pop(0)
+                self.msg_seq_buffer.append(sequence)
+                print(f"{self.__class__.__name__} added sequence={sequence} to buffer, buffer={self.msg_seq_buffer}", file=sys.stderr)
+            else:
+                print(f"{self.__class__.__name__} IGNORING duplicate/old sequence={sequence}, buffer={self.msg_seq_buffer}", file=sys.stderr)
+
         if self.inpacket is not None:
             print(f"{self.__class__.__name__} Port:{self.port} sequence={sequence} plaintext={plaintext}", file=sys.stderr)
             self.inpacket = None
@@ -1658,6 +1697,12 @@ class UpHandler(PortHandler):
         self.send_queue = send_queue
         self.recv_queue = recv_queue
         self.to_comm    = to_comm
+        
+        # Initialize bandwidth upload mode attributes before forking
+        self.bwup_mode  = False
+        self.bwup_start_time     = None
+        self.bwup_bytes_sent     = 0
+        self.bwup_statistic_time = None
 
         self.run_in_own_process()
 
@@ -1674,6 +1719,25 @@ class UpHandler(PortHandler):
     def handle_message(self, msg):
         """Handle a message received from the queue. Returns False to stop the loop."""
         print(f"{self.__class__.__name__} received message: {msg}")
+        
+        # Handle BWUP messages
+        if isinstance(msg, dict) and "bwup" in msg:
+            duration = msg.get("bwup")
+            print(f"{self.__class__.__name__} received BWUP message with duration={duration} seconds", file=sys.stderr)
+            
+            # Initialize bandwidth upload mode if not already active
+            if not self.bwup_mode:
+                current_timestamp = time.time_ns() // 1_000_000  # milliseconds
+                self.bwup_start_time = current_timestamp
+                self.bwup_mode = True
+                print(f"{self.__class__.__name__} started BWUP mode at timestamp={current_timestamp}", file=sys.stderr)
+                
+                # Initialize statistic time if None
+                if self.bwup_statistic_time is None:
+                    self.bwup_statistic_time = current_timestamp
+                    print(f"{self.__class__.__name__} initialized bwup_statistic_time={current_timestamp}", file=sys.stderr)
+        
+        # Handle stop command
         if msg == CommMsg.STOP:
             return False
         return True
@@ -1974,6 +2038,7 @@ class ClientCtrlHandler(ClientPortHandler):
         self.to_comm    = to_comm
         self.server_addr = server_addr
         self.to_server_msgs = {}  # Dictionary to store messages awaiting ACK
+        self.msg_sequence = 1  # Sequential message counter starting at 1
 
         self.run_in_own_process()
 
@@ -2019,11 +2084,11 @@ class ClientCtrlHandler(ClientPortHandler):
             if msg.get("cmd") == "bwup":
                 duration = msg.get("duration")
                 print(f"{self.__class__.__name__} received bwup command with duration={duration} seconds")
-                # Generate random key and store message
-                import random
-                random_key = random.randint(1000000, 9999999)
-                self.to_server_msgs[random_key] = {"bwup": duration}
-                print(f"{self.__class__.__name__} stored bwup message with key={random_key}")
+                # Use sequential msg_sequence and store message
+                seq_num = self.msg_sequence
+                self.to_server_msgs[seq_num] = {"bwup": duration}
+                print(f"{self.__class__.__name__} stored bwup message with sequence={seq_num}")
+                self.msg_sequence += 1  # Increment for next message
         # Handle enum messages
         if msg == CommMsg.STOP:
             return False
@@ -2460,6 +2525,69 @@ class BittrRtClient:
 
 
 def main():
+    # Check for --help argument first
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(f"""bittrrt.py v{VERSION} - Secure UDP communication tool
+{VERSION_NOTE}
+
+USAGE:
+    Server mode:
+        python bittrrt.py --server [OPTIONS]
+    
+    Client mode:
+        python bittrrt.py [address:port] [OPTIONS]
+    
+    Config management:
+        python bittrrt.py --create-config [OPTIONS]
+
+SERVER MODE OPTIONS:
+    --server                Run in server mode
+    --bind-addr <address>   Bind address (default: 0.0.0.0)
+    --bind-port <port>      Bind port (default: 6711)
+    --port-ranges <ranges>  Port ranges for connections (format: start-end,start-end)
+                            (default: 6712-6720)
+    --port-parallelability  Parallelization mode: SINGLE, THREAD, or PROCESS
+                            (default: SINGLE)
+    --heartbeat-rate <ms>   Heartbeat rate in milliseconds (default: 5000)
+    --sync-test             Enable sync testing mode
+
+CLIENT MODE OPTIONS:
+    address:port            Target server address and optional port
+                            (default: 127.0.0.1:6711)
+    --bwup <seconds>        Bandwidth upload duration in seconds (default: 30)
+    --bind-addr <address>   Override bind address from config
+    --bind-port <port>      Override bind port from config
+    --heartbeat-rate <ms>   Override heartbeat rate from config
+
+CONFIG MANAGEMENT:
+    --create-config         Create or update config file at ~/.bittrrt/config
+                            Can be combined with other options to set values:
+                            --bind-addr, --bind-port, --port-ranges,
+                            --port-parallelability, --heartbeat-rate
+
+EXAMPLES:
+    # Create default config file
+    python bittrrt.py --create-config
+
+    # Create config with custom port
+    python bittrrt.py --create-config --bind-port 8080
+
+    # Run server with default config
+    python bittrrt.py --server
+
+    # Run server with custom bind address
+    python bittrrt.py --server --bind-addr 192.168.1.100
+
+    # Connect to server (client mode)
+    python bittrrt.py 192.168.1.100:6711
+
+    # Connect to server with 60 second bandwidth upload test
+    python bittrrt.py 192.168.1.100:6711 --bwup 60
+
+For more information, see README.md
+""")
+        sys.exit(0)
+    
     config_path = os.path.expanduser("~/.bittrrt/config")
     default_config = {
         "bind_addr": "0.0.0.0",
@@ -2479,7 +2607,7 @@ def main():
             "--port-parallelability": "port_parallelability",
             "--heartbeat-rate": "heartbeat_rate"
         }
-        known_args = set(["--create-config"] + list(arg_map.keys()))
+        known_args = set(["--create-config", "--help", "-h"] + list(arg_map.keys()))
         used_args = set()
         # Parse known arguments and collect used
         for arg, key in arg_map.items():
@@ -2568,7 +2696,7 @@ def main():
 
     # Validate unknown dash-arguments: any argument that starts with a dash
     # but is not a recognized CLI option should cause an error and exit.
-    known_args = set(cli_arg_map.keys()) | {"--sync-test", "--create-config", "--server", "--bwup"}
+    known_args = set(cli_arg_map.keys()) | {"--sync-test", "--create-config", "--server", "--bwup", "--help", "-h"}
     for arg in argv[1:]:
         if isinstance(arg, str) and arg.startswith("-") and arg not in known_args:
             print(f"Error: Unknown argument '{arg}'", file=sys.stderr)
